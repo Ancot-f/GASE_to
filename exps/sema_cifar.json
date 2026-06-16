@@ -9,7 +9,7 @@
     "increment": 10,
     "model_name": "sema",
     "backbone_type": "pretrained_vit_b16_224_adapter",
-    "device": ["0"],
+    "device": "auto",
     "seed": [1993],
     
     "batch_size":32,

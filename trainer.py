@@ -1,12 +1,16 @@
 import sys
 import logging
 import copy
+import os
+import numpy as np
 import torch
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from utils import factory
 from utils.data_manager import DataManager
 from utils.toolkit import count_parameters
-import os
-import numpy as np
+from common.utils.seed import set_seed, set_device
 
 
 def train(args):
@@ -45,8 +49,8 @@ def _train(args):
         ],
     )
 
-    _set_random(args["seed"])
-    _set_device(args)
+    set_seed(args["seed"])
+    args["device"] = set_device(args["device"])
     print_args(args)
 
     data_manager = DataManager(
@@ -118,29 +122,6 @@ def _train(args):
 
             print('Average Accuracy (CNN):', sum(cnn_curve["top1"])/len(cnn_curve["top1"]))
             logging.info("Average Accuracy (CNN): {} \n".format(sum(cnn_curve["top1"])/len(cnn_curve["top1"])))
-
-
-def _set_device(args):
-    device_type = args["device"]
-    gpus = []
-
-    for device in device_type:
-        if device == -1:
-            device = torch.device("cpu")
-        else:
-            device = torch.device("cuda:{}".format(device))
-
-        gpus.append(device)
-
-    args["device"] = gpus
-
-
-def _set_random(seed=1):
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
 
 
 def print_args(args):

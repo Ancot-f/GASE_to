@@ -1,15 +1,19 @@
 import sys
 import logging
 import copy
-import torch
-from torch import nn
-from torch.utils.data import DataLoader
-from utils import factory
-from utils.data_manager import DataManager
-from utils.toolkit import count_parameters
 import os
 import re
 import numpy as np
+import torch
+from torch import nn
+from torch.utils.data import DataLoader
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from utils import factory
+from utils.data_manager import DataManager
+from utils.toolkit import count_parameters
+from common.utils.seed import set_seed, set_device
 
 def eval(args):
     args["seed"]=args["seed"][0]
@@ -34,8 +38,8 @@ def eval(args):
         ],
     )
 
-    _set_random(args["seed"])
-    _set_device(args)
+    set_seed(args["seed"])
+    args["device"] = set_device(args["device"])
     print_args(args)
 
     data_manager = DataManager(
@@ -83,29 +87,6 @@ def get_adapter_pattern(checkpt_path):
 
 
     
-def _set_device(args):
-    device_type = args["device"]
-    gpus = []
-
-    for device in device_type:
-        if device == -1:
-            device = torch.device("cpu")
-        else:
-            device = torch.device("cuda:{}".format(device))
-
-        gpus.append(device)
-
-    args["device"] = gpus
-
-
-def _set_random(seed=1):
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-
-
 def print_args(args):
     for key, value in args.items():
         logging.info("{}: {}".format(key, value))

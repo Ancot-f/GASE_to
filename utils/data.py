@@ -1,6 +1,7 @@
 import numpy as np
 from torchvision import datasets, transforms
 from utils.toolkit import split_images_labels
+from common.utils.paths import get_dataset_path
 
 
 class iData(object):
@@ -28,8 +29,8 @@ class iCIFAR10(iData):
     class_order = np.arange(10).tolist()
 
     def download_data(self):
-        train_dataset = datasets.cifar.CIFAR10("/data/Datasets", train=True, download=True)
-        test_dataset = datasets.cifar.CIFAR10("/data/Datasets", train=False, download=True)
+        train_dataset = datasets.cifar.CIFAR10(get_dataset_path(), train=True, download=True)
+        test_dataset = datasets.cifar.CIFAR10(get_dataset_path(), train=False, download=True)
         self.train_data, self.train_targets = train_dataset.data, np.array(
             train_dataset.targets
         )
@@ -56,8 +57,8 @@ class iCIFAR100(iData):
     class_order = np.arange(100).tolist()
 
     def download_data(self):
-        train_dataset = datasets.cifar.CIFAR100("/data/Datasets", train=True, download=True)
-        test_dataset = datasets.cifar.CIFAR100("/data/Datasets", train=False, download=True)
+        train_dataset = datasets.cifar.CIFAR100(get_dataset_path(), train=True, download=True)
+        test_dataset = datasets.cifar.CIFAR100(get_dataset_path(), train=False, download=True)
         self.train_data, self.train_targets = train_dataset.data, np.array(
             train_dataset.targets
         )
@@ -137,8 +138,8 @@ class iCIFAR224(iData):
         self.class_order = np.arange(100).tolist()
 
     def download_data(self):
-        train_dataset = datasets.cifar.CIFAR100("/data/Datasets", train=True, download=True)
-        test_dataset = datasets.cifar.CIFAR100("/data/Datasets", train=False, download=True)
+        train_dataset = datasets.cifar.CIFAR100(get_dataset_path(), train=True, download=True)
+        test_dataset = datasets.cifar.CIFAR100(get_dataset_path(), train=False, download=True)
         self.train_data, self.train_targets = train_dataset.data, np.array(
             train_dataset.targets
         )
@@ -225,8 +226,8 @@ class iImageNetR(iData):
 
     def download_data(self):
         # assert 0, "You should specify the folder of your dataset"
-        train_dir = "/data/Datasets/imagenet-r/train/"
-        test_dir = "/data/Datasets/imagenet-r/test/"
+        train_dir = get_dataset_path("imagenet-r") + "/train/"
+        test_dir = get_dataset_path("imagenet-r") + "/test/"
 
         train_dset = datasets.ImageFolder(train_dir)
         test_dset = datasets.ImageFolder(test_dir)
@@ -246,8 +247,8 @@ class iImageNetA(iData):
 
     def download_data(self):
         # assert 0, "You should specify the folder of your dataset"
-        train_dir = "/data/Datasets/imagenet-a/train/"
-        test_dir = "/data/Datasets/imagenet-a/test/"
+        train_dir = get_dataset_path("imagenet-a") + "/train/"
+        test_dir = get_dataset_path("imagenet-a") + "/test/"
 
         train_dset = datasets.ImageFolder(train_dir)
         test_dset = datasets.ImageFolder(test_dir)
@@ -268,8 +269,8 @@ class CUB(iData):
 
     def download_data(self):
         # assert 0, "You should specify the folder of your dataset"
-        train_dir = "/data/Datasets/cub/train/"
-        test_dir = "/data/Datasets/cub/test/"
+        train_dir = get_dataset_path("cub") + "/train/"
+        test_dir = get_dataset_path("cub") + "/test/"
 
         train_dset = datasets.ImageFolder(train_dir)
         test_dset = datasets.ImageFolder(test_dir)
@@ -289,8 +290,8 @@ class objectnet(iData):
 
     def download_data(self):
         # assert 0, "You should specify the folder of your dataset"
-        train_dir = "/data/Datasets/objectnet/train/"
-        test_dir = "/data/Datasets/objectnet/test/"
+        train_dir = get_dataset_path("objectnet") + "/train/"
+        test_dir = get_dataset_path("objectnet") + "/test/"
 
         train_dset = datasets.ImageFolder(train_dir)
         test_dset = datasets.ImageFolder(test_dir)
@@ -310,8 +311,8 @@ class omnibenchmark(iData):
 
     def download_data(self):
         # assert 0, "You should specify the folder of your dataset"
-        train_dir = "/data/Datasets/omnibenchmark/train/"
-        test_dir = "/data/Datasets/omnibenchmark/test/"
+        train_dir = get_dataset_path("omnibenchmark") + "/train/"
+        test_dir = get_dataset_path("omnibenchmark") + "/test/"
 
         train_dset = datasets.ImageFolder(train_dir)
         test_dset = datasets.ImageFolder(test_dir)
@@ -332,8 +333,8 @@ class vtab(iData):
 
     def download_data(self):
         # assert 0, "You should specify the folder of your dataset"
-        train_dir = "/data/Datasets/vtab/train/"
-        test_dir = "/data/Datasets/vtab/test/"
+        train_dir = get_dataset_path("vtab") + "/train/"
+        test_dir = get_dataset_path("vtab") + "/test/"
 
         train_dset = datasets.ImageFolder(train_dir)
         test_dset = datasets.ImageFolder(test_dir)
