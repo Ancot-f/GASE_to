@@ -66,22 +66,6 @@ def get_backbone(args, pretrained=False):
         # GASE registration
         if args["model_name"] == "gase":
             from backbone import vit_gase
-            from easydict import EasyDict
-            tuning_config = EasyDict(
-                ffn_adapt=True,
-                ffn_option="parallel",
-                ffn_adapter_layernorm_option="none",
-                ffn_adapter_init_option="lora",
-                ffn_adapter_scalar="0.1",
-                ffn_num=args.get("ffn_num", 16),
-                ffn_adapter_type=args.get("ffn_adapter_type", "adaptmlp"),
-                d_model=768,
-                vpt_on=False,
-                vpt_num=0,
-                exp_threshold=args.get("exp_threshold", 2),
-                adapt_start_layer=args.get("adapt_start_layer", 9),
-                adapt_end_layer=args.get("adapt_end_layer", 11),
-            )
             if name == "pretrained_vit_b16_224_gase":
                 model = vit_gase.ViTGASE(
                     backbone_name="vit_base_patch16_224",
@@ -102,7 +86,7 @@ def get_backbone(args, pretrained=False):
                 model.out_dim = 768
             else:
                 raise NotImplementedError("Unknown type {}".format(name))
-            return model.eval()
+            return model
         else:
             raise NotImplementedError("Inconsistent model name and model type")
 
@@ -605,6 +589,35 @@ class SEMAVitNet(BaseNet):
         x = out["features"]
         out.update({"logits": self.fc(x)})
         return out
+
+
+# GASE registration
+class GASEVitNet(BaseNet):
+    """
+    Network wrapper for GASE ViT backbone.
+
+    ViTGASE already includes its own classifier head, so self.fc is
+    an alias to backbone.head for compatibility with existing APIs.
+    """
+
+    def __init__(self, args, pretrained):
+        super().__init__(args, pretrained)
+        self.args = args
+
+    @property
+    def fc(self):
+        return self.backbone.head
+
+    @fc.setter
+    def fc(self, value):
+        self.backbone.head = value
+
+    def extract_vector(self, x):
+        return self.backbone.forward_features(x)
+
+    def forward(self, x):
+        return self.backbone(x)
+
 
 # l2p and dualprompt
 class PromptVitNet(nn.Module):

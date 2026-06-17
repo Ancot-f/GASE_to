@@ -3,47 +3,40 @@ GASEAtlasBlock: ViT transformer block augmented with GASE adapters.
 
 Key modes:
 - "task_train": uses task_adapter for teacher residual generation.
-- "distill": collects h_chart (pre-current-adapter feature on permanent path)
-  and teacher residual for distilling chart/free adapters.
-- "infer": uses chart-adapter/free-adapter; task-adapter is disabled.
+  Residual is applied ONLY to the CLS token, not patch tokens.
+- "distill": placeholder for feature collection (Phase-3+).
+- "infer": uses chart-adapter/free-adapter (Phase-3+); identity in Phase-2.
 
-CRITICAL: h_chart is the feature that the router sees at inference time —
-it is the pre-current-adapter feature on the permanent path, NOT the
-task-adapter output, NOT backbone-fixed features.
+CRITICAL: h_chart is the pre-adapter CLS feature on the permanent path.
 """
 
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import torch
 from torch import Tensor
 from torch import nn
 
-from .gase_components import TASK_TRAIN, DISTILL, INFER, ResidualOutput, RoutingOutput
+from .gase_components import TASK_TRAIN, DISTILL, INFER, RoutingOutput
 
 
 class GASEAtlasBlock(nn.Module):
     """
     A ViT block augmented with GASE atlas capabilities.
 
-    Wraps an original ViT block and adds:
-    - TaskAdapter (temporary, per-task teacher).
-    - ChartRouter + ChartAdapters (permanent, task-agnostic).
-    - SlotRouter (key-based or learned).
-    - FreeAdapter (permanent, catches leftover residual).
+    Wraps an original timm ViT block. In task_train mode, applies
+    a TaskAdapter residual to the CLS token only. Chart/slot/free
+    adapters are Phase-3+.
 
     Attributes:
         layer_id: ViT block index (e.g., 9, 10, 11).
         dim: feature dimension D.
-        original_block: the original ViT transformer block.
+        original_block: the original timm ViT Block.
         task_adapter: temporary per-task adapter (TaskAdapter).
-        chart_router: routes features to top-m charts.
-        slot_router: routes features to top-k slots within a chart.
-        chart_adapters: dict (chart_id, slot_id) -> ChartAdapter.
-        free_adapter: FreeAdapter for residual leftover.
-        adapter_mode: current mode (TASK_TRAIN / DISTILL / INFER).
-        use_free_adapter: whether free-adapter is enabled.
-        use_soft_chart_routing: whether to soft-mix multiple chart outputs.
-        use_identity_fallback: whether to fall back to identity on high uncertainty.
+        chart_router: routes features to charts (Phase-3+).
+        slot_router: routes to slots within a chart (Phase-3+).
+        chart_adapters: dict (chart_id, slot_id) -> ChartAdapter (Phase-3+).
+        free_adapter: FreeAdapter for residual leftover (Phase-3+).
+        adapter_mode: current mode.
     """
 
     def __init__(
@@ -53,23 +46,16 @@ class GASEAtlasBlock(nn.Module):
         dim: int,
         config: dict,
     ):
-        """
-        Args:
-            original_block: the original ViT Block to wrap.
-            layer_id: ViT block index.
-            dim: feature dimension D.
-            config: GASE configuration dict.
-        """
         super().__init__()
         self.layer_id = layer_id
         self.dim = dim
         self.original_block = original_block
 
-        # Placeholder modules (created during first task)
+        # Adapters (created on demand)
         self.task_adapter: Optional[nn.Module] = None
         self.chart_router: Optional[nn.Module] = None
         self.slot_router: Optional[nn.Module] = None
-        self.chart_adapters: Dict[Tuple[int, int], nn.Module] = nn.ModuleDict()
+        self.chart_adapters: Dict[str, nn.Module] = nn.ModuleDict()
         self.free_adapter: Optional[nn.Module] = None
 
         self.adapter_mode: str = INFER
@@ -79,6 +65,10 @@ class GASEAtlasBlock(nn.Module):
         self.use_soft_chart_routing: bool = routing_cfg.get("use_soft_chart_routing", True)
         self.use_identity_fallback: bool = routing_cfg.get("use_identity_fallback", True)
 
+    # ------------------------------------------------------------------
+    #  Forward
+    # ------------------------------------------------------------------
+
     def forward(
         self,
         x: Tensor,
@@ -86,6 +76,11 @@ class GASEAtlasBlock(nn.Module):
     ) -> Tuple[Tensor, Optional[RoutingOutput]]:
         """
         Forward pass through the GASE block.
+
+        1. Pass x through the original ViT block.
+        2. Extract h_chart (CLS token).
+        3. In task_train mode: apply task_adapter residual to CLS token.
+        4. In distill/infer mode: Phase-2 identity pass-through.
 
         Args:
             x: input features of shape [B, N, D].
@@ -95,27 +90,18 @@ class GASEAtlasBlock(nn.Module):
             Tuple of (output [B, N, D], optional RoutingOutput).
         """
         x = self.forward_original_block(x)
-        routing_info = None
 
         if self.adapter_mode == TASK_TRAIN and self.task_adapter is not None:
             h_chart = self.get_router_feature(x)
             delta_task = self.apply_task_adapter(h_chart)
-            # Apply residual to CLS token (index 0)
-            if x.dim() == 3 and x.shape[1] > 1 and delta_task.shape == x[:, 0].shape:
-                x = x.clone()
-                x[:, 0] = x[:, 0] + delta_task
-        elif self.adapter_mode == DISTILL:
-            # Placeholder: in real impl, collect h_chart and delta_teacher for caching.
-            pass
-        elif self.adapter_mode == INFER:
-            # Phase-1: identity (chart/slot routing not yet implemented).
-            pass
+            x = self.add_delta_to_cls(x, delta_task)
 
+        routing_info = None
         return x, routing_info
 
     def forward_original_block(self, x: Tensor) -> Tensor:
         """
-        Forward through the original ViT block (attention + MLP).
+        Forward through the original timm ViT block (attention + MLP).
 
         Args:
             x: input features [B, N, D].
@@ -125,29 +111,62 @@ class GASEAtlasBlock(nn.Module):
         """
         return self.original_block(x)
 
-    def get_router_feature(self, x: Tensor) -> Tensor:
+    def add_delta_to_cls(self, x: Tensor, delta: Tensor) -> Tensor:
         """
-        Extract the feature used for chart/slot routing.
-
-        h_chart is the pre-current-adapter feature on the permanent path,
-        computed before any adapter is applied at this block.
+        Add adapter residual to CLS token only.
 
         Args:
-            x: input features [B, N, D].
+            x: features of shape [B, N, D] or [B, D].
+            delta: residual of shape [B, D].
 
         Returns:
-            h_chart of shape [B, D] (cls token).
+            Tensor with the same shape as x, with delta added to CLS.
+        """
+        if x.dim() == 3:
+            # [B, N, D] — add to CLS token (position 0) only
+            x = x.clone()
+            x[:, 0, :] = x[:, 0, :] + delta
+            return x
+        elif x.dim() == 2:
+            # [B, D] — add directly
+            return x + delta
+        else:
+            raise ValueError(f"Expected x of shape [B, N, D] or [B, D], got {x.shape}")
+
+    # ------------------------------------------------------------------
+    #  Router feature
+    # ------------------------------------------------------------------
+
+    def get_router_feature(self, x: Tensor) -> Tensor:
+        """
+        Extract the CLS-token feature used for routing.
+
+        h_chart is the pre-current-adapter feature on the permanent path,
+        i.e., the output of the ORIGINAL block before any adapter residual.
+
+        Args:
+            x: features after original block, shape [B, N, D] or [B, D].
+
+        Returns:
+            h_chart of shape [B, D] (CLS token or full feature).
         """
         if x.dim() == 3:
             return x[:, 0]  # CLS token
-        return x  # already [B, D]
+        elif x.dim() == 2:
+            return x
+        else:
+            raise ValueError(f"Expected x of shape [B, N, D] or [B, D], got {x.shape}")
+
+    # ------------------------------------------------------------------
+    #  Adapter application
+    # ------------------------------------------------------------------
 
     def apply_task_adapter(self, h_chart: Tensor) -> Tensor:
         """
         Apply task-adapter in task_train mode.
 
         Args:
-            h_chart: pre-adapter features [B, D].
+            h_chart: pre-adapter CLS features [B, D].
 
         Returns:
             delta_task of shape [B, D].
@@ -163,7 +182,7 @@ class GASEAtlasBlock(nn.Module):
         slot_probs: Optional[Tensor] = None,
     ) -> Tensor:
         """
-        Apply chart-adapters with routing.
+        Apply chart-adapters with routing (Phase-3+).
 
         Args:
             h_chart: pre-adapter features [B, D].
@@ -173,12 +192,12 @@ class GASEAtlasBlock(nn.Module):
         Returns:
             delta_chart of shape [B, D].
         """
-        # Phase-1 placeholder: return zeros. Real routing in Phase-2+.
-        return torch.zeros_like(h_chart)
+        # Phase-2 placeholder
+        raise NotImplementedError("Phase-2 does not implement chart routing.")
 
     def apply_free_adapter(self, h_chart: Tensor) -> Tensor:
         """
-        Apply free-adapter.
+        Apply free-adapter (Phase-3+).
 
         Args:
             h_chart: pre-adapter features [B, D].
@@ -198,12 +217,7 @@ class GASEAtlasBlock(nn.Module):
         routing_info: Optional[RoutingOutput] = None,
     ) -> Tensor:
         """
-        Combine residuals from different adapter sources.
-
-        Combination depends on adapter_mode:
-        - TASK_TRAIN: only delta_task.
-        - DISTILL: only delta_task (for collection).
-        - INFER: delta_chart + gate * delta_free, with fallback.
+        Combine residuals from different adapter sources (Phase-3+).
 
         Args:
             delta_task: task-adapter residual [B, D].
@@ -216,15 +230,17 @@ class GASEAtlasBlock(nn.Module):
         """
         if self.adapter_mode == TASK_TRAIN:
             return delta_task if delta_task is not None else torch.zeros(1)
-        elif self.adapter_mode == INFER:
+        else:
             total = torch.zeros(1)
             if delta_chart is not None:
                 total = total + delta_chart
             if delta_free is not None and self.use_free_adapter:
                 total = total + delta_free
             return total
-        else:
-            return delta_task if delta_task is not None else torch.zeros(1)
+
+    # ------------------------------------------------------------------
+    #  Mode & registration
+    # ------------------------------------------------------------------
 
     def set_adapter_mode(self, mode: str) -> None:
         """
@@ -243,14 +259,7 @@ class GASEAtlasBlock(nn.Module):
         slot_id: int,
         adapter: nn.Module,
     ) -> None:
-        """
-        Register a chart-adapter for a specific (chart, slot) pair.
-
-        Args:
-            chart_id: chart id.
-            slot_id: slot id.
-            adapter: ChartAdapter module.
-        """
+        """Register a chart-adapter for a (chart, slot) pair."""
         key = f"{chart_id}_{slot_id}"
         self.chart_adapters[key] = adapter
 
@@ -260,8 +269,15 @@ class GASEAtlasBlock(nn.Module):
 
     def freeze_permanent_adapters(self) -> None:
         """Freeze all permanent adapters (chart, free, routers)."""
-        raise NotImplementedError("Phase-0 skeleton only.")
+        for adapter in self.chart_adapters.values():
+            for p in adapter.parameters():
+                p.requires_grad = False
+        if self.free_adapter is not None:
+            for p in self.free_adapter.parameters():
+                p.requires_grad = False
 
     def unfreeze_task_adapter(self) -> None:
         """Unfreeze task-adapter for training."""
-        raise NotImplementedError("Phase-0 skeleton only.")
+        if self.task_adapter is not None:
+            for p in self.task_adapter.parameters():
+                p.requires_grad = True
