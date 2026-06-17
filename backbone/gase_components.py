@@ -11,6 +11,9 @@ DISTILL = "distill"
 INFER = "infer"
 L9_CHART_STUDENT = "l9_chart_student"
 SEQUENTIAL_CHART_STUDENT = "sequential_chart_student"
+CURRENT_SLOT_STUDENT = "current_slot_student"
+ORACLE_SLOT_STUDENT = "oracle_slot_student"
+KEY_SLOT_STUDENT = "key_slot_student"
 
 # Chart state constants
 CHART_CANDIDATE = "candidate"
@@ -30,15 +33,7 @@ SLOT_RETIRED = "retired"
 
 @dataclass
 class ResidualOutput:
-    """
-    Residual outputs from different adapter types for one GASE block.
-
-    Attributes:
-        delta_task: task-adapter residual of shape [B, D].
-        delta_chart: chart-adapter residual of shape [B, D].
-        delta_free: free-adapter residual of shape [B, D].
-        delta_total: combined residual of shape [B, D].
-    """
+    """Residual outputs from different adapter types for one GASE block."""
 
     delta_task: Optional[Tensor] = None
     delta_chart: Optional[Tensor] = None
@@ -48,17 +43,7 @@ class ResidualOutput:
 
 @dataclass
 class RoutingOutput:
-    """
-    Routing decisions for one GASE block.
-
-    Attributes:
-        chart_probs: p(chart | h) of shape [B, num_charts].
-        slot_probs: p(slot | h, chart) of shape [B, num_slots].
-        selected_chart_ids: top-m chart ids of shape [B, top_m].
-        selected_slot_ids: top-k slot ids of shape [B, top_k].
-        free_gate: free-adapter gate values of shape [B] in [0, 1].
-        fallback_mask: boolean mask of shape [B] for identity fallback.
-    """
+    """Routing decisions for one GASE block."""
 
     chart_probs: Optional[Tensor] = None
     slot_probs: Optional[Tensor] = None

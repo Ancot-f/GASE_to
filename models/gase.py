@@ -62,6 +62,9 @@ class GASELearner(BaseLearner):
         self.phase: str = args.get("phase", "task_adapter_only")
         self.phase4_report: Optional[Dict] = None
         self.phase5_report: Optional[Dict] = None
+        self.phase6_report: Optional[Dict] = None
+        self.phase6_oracle_eval: Optional[Dict] = None
+        self.phase6_key_eval: Optional[Dict] = None
         self.debug_max_tasks: int = args.get("debug_max_tasks", -1)
         self.stop_after_task: int = args.get("stop_after_task", -1)
 
@@ -216,12 +219,12 @@ class GASELearner(BaseLearner):
 
     def _freeze_backbone_except_task_adapters_and_classifier(self) -> None:
         """
-        Freeze entire model, then unfreeze task adapters and classifier head.
+        Freeze entire model, then unfreeze trainable modules.
 
         Strategy:
           1. Freeze all parameters.
-          2. Unfreeze task_adapter parameters in GASE blocks.
-          3. Unfreeze classifier head.
+          2. Task0: unfreeze L0-L8 SEMA adapters, L9-L11 task_adapters, head.
+          3. Task1+: L0-L8 adapters stay frozen (only L9-L11 task_adapters + head).
         """
         backbone = self._network.backbone
 
@@ -229,7 +232,7 @@ class GASELearner(BaseLearner):
         for p in backbone.parameters():
             p.requires_grad = False
 
-        # 2. Unfreeze task adapters
+        # 2. Unfreeze task adapters at L9-L11
         for blk in backbone.get_atlas_blocks():
             if blk.task_adapter is not None:
                 for p in blk.task_adapter.parameters():
@@ -238,6 +241,14 @@ class GASELearner(BaseLearner):
         # 3. Unfreeze head
         for p in backbone.head.parameters():
             p.requires_grad = True
+
+        # 4. Task0: also unfreeze L0-L8 SEMA-style adapters
+        if self._cur_task == 0:
+            from backbone.vit_gase import SEMAStyleAdapterBlock
+            for blk in backbone.blocks:
+                if isinstance(blk, SEMAStyleAdapterBlock):
+                    for p in blk.parameters():
+                        p.requires_grad = True
 
     def _log_trainable_parameters(self) -> None:
         """Log all trainable parameter names and total count."""
@@ -306,12 +317,24 @@ class GASELearner(BaseLearner):
     #  Task lifecycle
     # ==================================================================
 
+    def _check_debug_limits(self) -> bool:
+        """Return True if debug limits say we should skip this task."""
+        if self.debug_max_tasks > 0 and self._cur_task >= self.debug_max_tasks:
+            logging.info("[GASE] skipping task %d (debug_max_tasks=%d)",
+                         self._cur_task, self.debug_max_tasks)
+            return True
+        if self.stop_after_task >= 0 and self._cur_task > self.stop_after_task:
+            logging.info("[GASE] skipping task %d (stop_after_task=%d)",
+                         self._cur_task, self.stop_after_task)
+            return True
+        return False
+
     def before_task(self, task_id: int) -> None:
         """Prepare for a new task (Phase-2: no-op)."""
         pass
 
     def after_task(self):
-        """Post-task cleanup. Phase-3/4: optionally run collection + distillation."""
+        """Post-task cleanup."""
         self._known_classes = self._total_classes
         logging.info("Task %d completed. known_classes=%d", self._cur_task, self._known_classes)
 
@@ -333,20 +356,27 @@ class GASELearner(BaseLearner):
 
         # Phase-5: sequential L9→L10→L11 one-chart one-slot
         if self.phase == "sequential_one_chart_one_slot":
-            max_tasks = self.debug_max_tasks
-            stop_after = self.stop_after_task
-            if (max_tasks > 0 and self._cur_task >= max_tasks) or \
-               (stop_after >= 0 and self._cur_task > stop_after):
-                logging.info("[GASE] Phase-5: skipping task %d (debug limit)", self._cur_task)
-                return
+            if not self._check_debug_limits():
+                logging.info("[GASE] Phase-5: sequential L9→L10→L11 distillation...")
+                self.distill_sequential_one_chart_one_slot(
+                    task_id=self._cur_task, train_loader=self.train_loader
+                )
+                eval_metrics = self.evaluate_sequential_student_vs_teacher(self.test_loader)
+                if self.phase5_report is not None:
+                    self.phase5_report["eval"] = eval_metrics
 
-            logging.info("[GASE] Phase-5: sequential L9→L10→L11 distillation...")
-            self.distill_sequential_one_chart_one_slot(
-                task_id=self._cur_task, train_loader=self.train_loader
-            )
-            eval_metrics = self.evaluate_sequential_student_vs_teacher(self.test_loader)
-            if self.phase5_report is not None:
-                self.phase5_report["eval"] = eval_metrics
+        # Phase-6: multi-slot with oracle + key eval
+        if self.phase == "multi_slot_oracle":
+            if not self._check_debug_limits():
+                slot_id = self._cur_task
+                logging.info("[GASE] Phase-6: multi-slot distillation slot=%d...", slot_id)
+                self.distill_sequential_multi_slot_for_task(
+                    task_id=self._cur_task, train_loader=self.train_loader,
+                )
+                # Run oracle eval (upper bound) on all seen data
+                self.evaluate_oracle_slot_student(self.test_loader)
+                # Run key-slot eval (baseline) on all seen data
+                self.evaluate_key_slot_student(self.test_loader)
 
     # ==================================================================
     #  Reports (minimal debug versions)
@@ -383,22 +413,22 @@ class GASELearner(BaseLearner):
     # ==================================================================
 
     # ==================================================================
-    #  Phase-5: Generalized one-chart one-slot distillation per layer
+    #  Phase-6: Multi-slot distillation per layer
     # ==================================================================
 
     def distill_one_chart_one_slot_for_layer(
-        self, task_id: int, layer_id: int
+        self, task_id: int, layer_id: int, slot_id: Optional[int] = None,
     ) -> Dict:
         """
-        Build one chart, one slot, and one LinearChartAdapter for a target layer.
+        Build/reuse one chart, create one new slot, fit one adapter.
 
-        Reads cached features from self.distill_cache, fits PPCA chart,
-        cross-covariance slot, ridge-regression LinearChartAdapter,
-        and registers everything into the corresponding GASEAtlasBlock.
+        Phase-6: chart_id=0 is reused across tasks. Each task creates
+        a new slot_id (defaults to task_id). Old slots are frozen.
 
         Args:
             task_id: current task id.
             layer_id: target atlas layer (9, 10, or 11).
+            slot_id: slot id (defaults to task_id).
 
         Returns:
             Dict with chart, slot, distill metrics.
@@ -407,62 +437,64 @@ class GASELearner(BaseLearner):
         from gase.slots.slot_builder import SlotBuilder
         from gase.distill.chart_distiller import ChartAdapterDistiller
 
+        slot_id = task_id if slot_id is None else slot_id
+
         batch = self.distill_cache.get_layer_cache(layer_id)
         h_chart = batch.h_chart.to(self._device)
         delta_teacher = batch.delta_teacher.to(self._device)
 
-        logging.info(
-            "[SequentialDistill] Start layer=%d, task=%d samples=%d",
-            layer_id, task_id, h_chart.shape[0],
-        )
-
-        # Build chart
-        chart_builder = ChartBuilder(self.args.get("chart", {}))
-        chart_state = chart_builder.build_single_chart_for_layer(
-            h_chart, layer_id=layer_id, chart_id=0
-        )
+        # Reuse or build chart
+        blk = self._network.backbone.get_block(layer_id)
+        if len(blk.chart_states) > 0 and 0 in blk.chart_states:
+            chart_state = blk.chart_states[0]
+            logging.info(
+                "[L%dChart][slot=%d] reusing existing chart, support=%d",
+                layer_id, slot_id, chart_state.n_support,
+            )
+        else:
+            chart_builder = ChartBuilder(self.args.get("chart", {}))
+            chart_state = chart_builder.build_single_chart_for_layer(
+                h_chart, layer_id=layer_id, chart_id=0,
+            )
+            blk.register_chart(chart_state)
         self.chart_atlases[layer_id] = [chart_state]
 
         # Build slot
         slot_builder = SlotBuilder(self.args.get("slot", {}))
         slot_state = slot_builder.create_single_slot_from_residuals(
-            chart_state, h_chart, delta_teacher, task_id=task_id, slot_id=0
+            chart_state, h_chart, delta_teacher, task_id=task_id, slot_id=slot_id,
         )
 
         # Fit adapter
         distiller = ChartAdapterDistiller(self.args.get("distill", {}))
         adapter, metrics = distiller.fit_linear_chart_adapter(
-            chart_state, slot_state, h_chart, delta_teacher
+            chart_state, slot_state, h_chart, delta_teacher,
         )
 
-        # Register into GASEAtlasBlock
-        blk = self._network.backbone.get_block(layer_id)
-        blk.register_chart(chart_state)
-        blk.register_chart_adapter(chart_id=0, slot_id=0, adapter=adapter)
+        # Register adapter + slot (freeze=True keeps old slots frozen)
+        blk.register_slot(slot_state)
+        blk.register_chart_adapter(chart_id=0, slot_id=slot_id, adapter=adapter, freeze=True)
 
+        committed_slots = blk.get_available_slot_ids(0)
         logging.info(
-            "[SequentialDistill] Committed layer=%d chart-adapter", layer_id,
+            "[CommittedSlots] layer=%d slots=%s", layer_id, committed_slots,
         )
 
         return {"chart": chart_state.to_dict(), "slot": slot_state.to_dict(),
                 "distill": metrics}
 
     # ------------------------------------------------------------------
-    #  Phase-5: Sequential three-layer pipeline
+    #  Phase-6: Sequential multi-slot pipeline for one task
     # ------------------------------------------------------------------
 
-    def distill_sequential_one_chart_one_slot(
-        self, task_id: int, train_loader
+    def distill_sequential_multi_slot_for_task(
+        self, task_id: int, train_loader,
     ) -> Dict:
         """
-        Phase-5 pipeline:
-          L9 collect -> distill -> register -> commit
-          L10 collect -> distill -> register -> commit
-          L11 collect -> distill -> register -> commit
+        Phase-6: sequential L9→L10→L11 distillation with slot_id=task_id.
 
-        Each lower-layer chart-adapter is committed before collecting
-        the next layer's features, ensuring h_chart is correct on the
-        permanent/student path.
+        Lower-layer prefix uses CURRENT_SLOT_STUDENT mode to ensure
+        that L10 collection sees L9's current-task slot, etc.
 
         Args:
             task_id: current task id.
@@ -478,97 +510,168 @@ class GASELearner(BaseLearner):
             self.distill_cache = DistillCache()
 
         collector = FeatureCollector(
-            model=self._network,
-            atlas_layers=[9],
-            device=self._device,
-            collect_mode="sequential",
+            model=self._network, atlas_layers=[9],
+            device=self._device, collect_mode="sequential",
         )
 
+        slot_id = task_id
         all_metrics: Dict[int, Dict] = {}
+        backbone = self._network.backbone
 
-        for layer_id in self.atlas_layers:  # [9, 10, 11]
-            # Determine which prefix layers have committed chart-adapters
+        logging.info("[MultiSlotDistill] task=%d slot_id=%d", task_id, slot_id)
+
+        for layer_id in self.atlas_layers:
             committed = [
                 lid for lid in self.atlas_layers if lid < layer_id
-                and self._network.backbone.get_block(lid).has_active_chart_adapter()
+                and backbone.get_block(lid).has_active_chart_adapter()
             ]
             logging.info(
-                "[SequentialDistill] Start layer=%d, prefix committed=%s",
-                layer_id, committed,
+                "[SequentialDistill] Start layer=%d, prefix committed=%s (using slot=%d)",
+                layer_id, committed, slot_id,
             )
 
-            # Collect features using sequential student mode on prefix
+            # Use current_slot_student for prefix layers
+            backbone.set_adapter_mode("current_slot_student")
+            backbone.set_active_slot_id(slot_id)
+
             batch = collector.collect_layer_features(
-                train_loader, layer_id=layer_id, task_id=task_id
+                train_loader, layer_id=layer_id, task_id=task_id,
             )
             self.distill_cache.add_layer_batch(layer_id, batch)
 
-            # Distill and register
-            metrics = self.distill_one_chart_one_slot_for_layer(task_id, layer_id)
+            metrics = self.distill_one_chart_one_slot_for_layer(
+                task_id=task_id, layer_id=layer_id, slot_id=slot_id,
+            )
             all_metrics[layer_id] = metrics
 
-        self.phase5_report = all_metrics
+        self.phase6_report = all_metrics
         return all_metrics
 
     # ------------------------------------------------------------------
-    #  Phase-5: Full teacher vs student eval
+    #  Phase-6: Oracle-slot eval (upper-bound diagnostic)
     # ------------------------------------------------------------------
 
-    def evaluate_sequential_student_vs_teacher(self, test_loader) -> Dict:
+    def evaluate_oracle_slot_student(self, data_loader) -> Dict:
         """
-        Compare full teacher path and full sequential chart-student path.
+        Evaluate using true labels to infer task_id → slot_id.
 
-        Teacher: L9/L10/L11 use task_adapter.
-        Student: committed layers use chart-adapter,
-                 uncommitted layers use task_adapter.
+        This is NOT task-agnostic — it only verifies that slots
+        preserve old tasks correctly (storage upper bound).
+
+        Groups samples by oracle slot_id and runs separate forward passes.
         """
         backbone = self._network.backbone
+        backbone.eval()
 
-        # Log which layers have committed chart-adapters
-        committed = [
-            lid for lid in self.atlas_layers
-            if backbone.get_block(lid).has_active_chart_adapter()
-        ]
-        logging.info(
-            "[SequentialStudentEval] committed_layers=%s", committed,
-        )
+        all_preds, all_labels_list = [], []
+        increment = self.args.get("increment", 10)
 
+        with torch.no_grad():
+            for _, inputs, targets in data_loader:
+                inputs = inputs.to(self._device)
+                targets_np = targets.cpu().numpy()
+                oracle_slot = targets_np // increment  # simple mapping
+                unique_slots = np.unique(oracle_slot)
+
+                batch_logits = None
+                for sid in unique_slots:
+                    mask = oracle_slot == sid
+                    if not mask.any():
+                        continue
+                    x_sub = inputs[mask]
+                    logits_sub = backbone.compute_oracle_slot_logits(x_sub, int(sid))
+                    logits_sub = logits_sub[:, :self._total_classes]
+                    if batch_logits is None:
+                        batch_logits = torch.zeros(len(targets_np), logits_sub.shape[1],
+                                                   device=logits_sub.device)
+                    batch_logits[torch.tensor(mask, device=logits_sub.device)] = logits_sub
+
+                topk_preds = torch.topk(batch_logits, k=self.topk, dim=1, largest=True, sorted=True)[1]
+                all_preds.append(topk_preds.cpu().numpy())
+                all_labels_list.append(targets_np)
+
+        y_pred = np.concatenate(all_preds)
+        y_true = np.concatenate(all_labels_list)
+        result = self._evaluate(y_pred, y_true)
+
+        logging.info("[OracleSlotEval] total=%.2f", result["top1"])
+        for key, val in sorted(result["grouped"].items()):
+            if "-" in key:
+                logging.info("[OracleSlotEval] %s=%.2f", key, val)
+
+        self.phase6_oracle_eval = result
+        return result
+
+    # ------------------------------------------------------------------
+    #  Phase-6: Key-slot eval (simple baseline)
+    # ------------------------------------------------------------------
+
+    def evaluate_key_slot_student(self, data_loader) -> Dict:
+        """
+        Evaluate using nearest slot key (KEY_SLOT_STUDENT mode).
+
+        Phase-6: uses batch-majority nearest slot.
+        Per-sample mixed routing will be Phase-7.
+        """
+        logging.info("[KeySlotEval] using batch-majority nearest slot key")
+
+        backbone = self._network.backbone
+        backbone.eval()
+
+        all_preds, all_labels_list = [], []
+
+        with torch.no_grad():
+            for _, inputs, targets in data_loader:
+                inputs = inputs.to(self._device)
+                logits = backbone.compute_key_slot_logits(inputs)
+                logits = logits[:, :self._total_classes]
+                topk_preds = torch.topk(logits, k=self.topk, dim=1, largest=True, sorted=True)[1]
+                all_preds.append(topk_preds.cpu().numpy())
+                all_labels_list.append(targets.cpu().numpy())
+
+        y_pred = np.concatenate(all_preds)
+        y_true = np.concatenate(all_labels_list)
+        result = self._evaluate(y_pred, y_true)
+
+        logging.info("[KeySlotEval] total=%.2f", result["top1"])
+        for key, val in sorted(result["grouped"].items()):
+            if "-" in key:
+                logging.info("[KeySlotEval] %s=%.2f", key, val)
+
+        self.phase6_key_eval = result
+        return result
+
+    # ------------------------------------------------------------------
+    #  Phase-5 backward compat wrappers
+    # ------------------------------------------------------------------
+
+    def distill_l9_one_chart_one_slot(self, task_id: int) -> Dict:
+        return self.distill_one_chart_one_slot_for_layer(task_id, layer_id=9)
+
+    def evaluate_l9_student_vs_teacher(self, test_loader) -> Dict:
+        return self.evaluate_sequential_student_vs_teacher(test_loader)
+
+    def distill_sequential_one_chart_one_slot(self, task_id, train_loader) -> Dict:
+        return self.distill_sequential_multi_slot_for_task(task_id, train_loader)
+
+    def evaluate_sequential_student_vs_teacher(self, test_loader) -> Dict:
+        """Evaluate using CURRENT_SLOT_STUDENT with slot=task_id."""
+        backbone = self._network.backbone
         backbone.set_adapter_mode("task_train")
         teacher_acc = self._compute_accuracy(self._network, test_loader)
 
-        backbone.set_adapter_mode("sequential_chart_student")
+        backbone.set_adapter_mode("current_slot_student")
+        backbone.set_active_slot_id(self.current_task_id)
         student_acc = self._compute_accuracy(self._network, test_loader)
 
         backbone.set_adapter_mode("task_train")
-
         gap = teacher_acc - student_acc
         logging.info(
             "[SequentialStudentEval] teacher_acc=%.2f student_acc=%.2f gap=%.2f",
             teacher_acc, student_acc, gap,
         )
-
-        eval_metrics = {
-            "teacher_acc": float(teacher_acc),
-            "student_acc": float(student_acc),
-            "gap": float(gap),
-        }
-
-        if self.phase5_report is not None:
-            self.phase5_report["eval"] = eval_metrics
-
-        return eval_metrics
-
-    # ------------------------------------------------------------------
-    #  Phase-4 backward compat wrappers
-    # ------------------------------------------------------------------
-
-    def distill_l9_one_chart_one_slot(self, task_id: int) -> Dict:
-        """Phase-4 backward compat: delegates to distill_one_chart_one_slot_for_layer."""
-        return self.distill_one_chart_one_slot_for_layer(task_id, layer_id=9)
-
-    def evaluate_l9_student_vs_teacher(self, test_loader) -> Dict:
-        """Phase-4 backward compat: delegates to evaluate_sequential_student_vs_teacher."""
-        return self.evaluate_sequential_student_vs_teacher(test_loader)
+        return {"teacher_acc": float(teacher_acc), "student_acc": float(student_acc),
+                "gap": float(gap)}
 
     def train_task_adapter(self, task_id: int, train_loader: DataLoader) -> None:
         raise NotImplementedError("Phase-2 uses _train() directly.")

@@ -1,0 +1,53 @@
+{
+    "prefix": "phase6_vtab",
+    "dataset": "vtab",
+    "memory_size": 0,
+    "memory_per_class": 0,
+    "fixed_memory": false,
+    "shuffle": false,
+    "init_cls": 10,
+    "increment": 10,
+    "model_name": "gase",
+    "backbone_type": "pretrained_vit_b16_224_gase",
+    "device": "auto",
+    "seed": [1993],
+
+    "batch_size": 16,
+    "weight_decay": 0.0001,
+    "min_lr": 1e-8,
+    "optimizer": "adam",
+
+    "epochs": 10,
+    "lr": 0.001,
+
+    "phase": "multi_slot_oracle",
+    "method": "gase",
+    "atlas_layers": [9, 10, 11],
+    "adapter_dim": 16,
+
+    "task_adapter": {
+        "bottleneck_dim": 16,
+        "dropout": 0.0,
+        "scale": 1.0
+    },
+
+    "chart": {
+        "rank": 8
+    },
+
+    "slot": {
+        "input_rank": 8,
+        "output_rank": 4,
+        "max_slots_per_chart": 10
+    },
+
+    "chart_adapter": {
+        "type": "linear"
+    },
+
+    "free_adapter": { "enabled": true },
+    "routing": { "use_soft_chart_routing": true },
+    "distill": { "ridge_lambda": 0.001 },
+
+    "debug_max_tasks": 2
+}

@@ -1,12 +1,14 @@
 """
 ViTGASE: ViT backbone wrapper for GASE-Atlas continual learning.
 
-Wraps a standard timm ViT and injects GASEAtlasBlocks at specified layers
-(default: L9, L10, L11). Supports task_train, distill, and infer modes.
+Wraps a standard timm ViT and injects:
+- SEMA-style frozen functional adapters at L0-L8
+- GASEAtlasBlocks at L9-L11 (atlas_layers).
 
 Does NOT modify vit_sema.py — this is an independent GASE backbone.
 """
 
+import math
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -15,7 +17,74 @@ from torch import Tensor
 import timm
 
 from .gase_block import GASEAtlasBlock
-from .gase_components import TASK_TRAIN, DISTILL, INFER, L9_CHART_STUDENT, SEQUENTIAL_CHART_STUDENT
+from .gase_components import (
+    TASK_TRAIN, DISTILL, INFER,
+    L9_CHART_STUDENT, SEQUENTIAL_CHART_STUDENT,
+    CURRENT_SLOT_STUDENT, ORACLE_SLOT_STUDENT, KEY_SLOT_STUDENT,
+)
+
+
+class SEMAStyleAdapterBlock(nn.Module):
+    """
+    SEMA-identical functional adapter block for L0-L8.
+
+    Replicates SEMA's Block.forward (vit_sema.py:87-107) exactly:
+      x = x + attn(norm1(x))           # attention residual
+      adapt_x = adapter(x)             # on FULL [B,N,D] → down→ReLU→up
+      residual = x                     # save attention output
+      x = mlp(norm2(x))                # MLP
+      x = x + adapt_x                  # parallel adapter
+      x = residual + x                 # final residual
+
+    The adapter matches SEMA's Adapter class: down_proj→ReLU→up_proj,
+    bias=True, init=lora (kaiming down, zeros up+bias).
+    No dropout or scale in forward (matches SEMA Adapter.forward).
+    """
+
+    def __init__(self, timm_block: nn.Module, dim: int, bottleneck: int = 16):
+        super().__init__()
+        self.dim = dim
+
+        # Extract components from timm block
+        self.norm1 = timm_block.norm1
+        self.attn = timm_block.attn
+        self.drop_path = getattr(timm_block, 'drop_path1',
+                                 getattr(timm_block, 'drop_path', nn.Identity()))
+        self.norm2 = timm_block.norm2
+        self.mlp = timm_block.mlp
+        self.drop_path2 = getattr(timm_block, 'drop_path2', nn.Identity())
+
+        # SEMA-identical adapter: D→bottleneck→D, bias=True
+        self.down_proj = nn.Linear(dim, bottleneck, bias=True)
+        self.act = nn.ReLU()
+        self.up_proj = nn.Linear(bottleneck, dim, bias=True)
+
+        # SEMA-identical init (init_option="lora")
+        nn.init.kaiming_uniform_(self.down_proj.weight, a=math.sqrt(5))
+        nn.init.zeros_(self.down_proj.bias)
+        nn.init.zeros_(self.up_proj.weight)
+        nn.init.zeros_(self.up_proj.bias)
+
+    def forward(self, x: Tensor) -> Tensor:
+        # 1. Attention residual (line 88 in sema Block.forward)
+        x = x + self.drop_path(self.attn(self.norm1(x)))
+
+        # 2. Adapter on FULL attention output [B, N, D] (line 89-90)
+        adapt_x = self.up_proj(self.act(self.down_proj(x)))
+
+        # 3. Save residual (line 92)
+        residual = x
+
+        # 4. MLP (lines 93-94)
+        x = self.norm2(x)
+        x = self.drop_path2(self.mlp(x))
+
+        # 5. Parallel: add adapter to MLP output (line 101)
+        x = x + adapt_x
+
+        # 6. Residual connection (line 105)
+        x = residual + x
+        return x
 
 
 class ViTGASE(nn.Module):
@@ -94,7 +163,9 @@ class ViTGASE(nn.Module):
         self.norm = base_vit.norm
         self.pre_logits = getattr(base_vit, "pre_logits", nn.Identity())
 
-        # Build block list, injecting GASEAtlasBlock at atlas_layers
+        # Build block list
+        # L0-L8: SEMA-style frozen functional adapter block
+        # L9-L11: GASEAtlasBlock (task_adapter / chart_adapter)
         num_blocks = len(base_vit.blocks)
         self.blocks = nn.ModuleList()
         for i in range(num_blocks):
@@ -103,7 +174,7 @@ class ViTGASE(nn.Module):
                 gase_blk = GASEAtlasBlock(orig_blk, layer_id=i, dim=self.embed_dim, config=self.config)
                 self.blocks.append(gase_blk)
             else:
-                self.blocks.append(orig_blk)
+                self.blocks.append(orig_blk)  # plain timm block, no adapter
 
         # Classifier head
         self.head = nn.Linear(self.embed_dim, self.num_classes) if self.num_classes > 0 else nn.Identity()
@@ -245,7 +316,8 @@ class ViTGASE(nn.Module):
         Args:
             mode: one of TASK_TRAIN, DISTILL, INFER.
         """
-        if mode not in (TASK_TRAIN, DISTILL, INFER, L9_CHART_STUDENT, SEQUENTIAL_CHART_STUDENT):
+        if mode not in (TASK_TRAIN, DISTILL, INFER, L9_CHART_STUDENT, SEQUENTIAL_CHART_STUDENT,
+                        CURRENT_SLOT_STUDENT, ORACLE_SLOT_STUDENT, KEY_SLOT_STUDENT):
             raise ValueError(f"Unknown adapter_mode: {mode}")
         self.adapter_mode = mode
         for blk in self.blocks:
@@ -393,22 +465,56 @@ class ViTGASE(nn.Module):
             self.set_adapter_mode(prev_mode)
 
     def compute_student_logits(self, images: Tensor) -> Tensor:
-        """
-        Compute logits using the sequential chart-adapter student path.
-
-        Temporarily switches to sequential_chart_student mode,
-        runs full forward pass, and restores the original adapter mode.
-
-        Args:
-            images: input images of shape [B, 3, H, W].
-
-        Returns:
-            Student logits of shape [B, num_classes].
-        """
+        """Compute logits using the sequential chart-adapter student path."""
         prev_mode = self.adapter_mode
         self.set_adapter_mode(SEQUENTIAL_CHART_STUDENT)
         try:
             out = self.forward(images)
             return out["logits"]
+        finally:
+            self.set_adapter_mode(prev_mode)
+
+    # ------------------------------------------------------------------
+    #  Slot management (Phase-6)
+    # ------------------------------------------------------------------
+
+    def set_active_slot_id(self, slot_id: Optional[int]) -> None:
+        """Set active slot id on all GASE blocks."""
+        for blk in self.blocks:
+            if isinstance(blk, GASEAtlasBlock):
+                blk.set_active_slot_id(slot_id)
+
+    def set_oracle_slot_id(self, slot_id: Optional[int]) -> None:
+        """Set oracle slot id on all GASE blocks."""
+        for blk in self.blocks:
+            if isinstance(blk, GASEAtlasBlock):
+                blk.set_oracle_slot_id(slot_id)
+
+    def compute_oracle_slot_logits(self, images: Tensor, slot_id: int) -> Tensor:
+        """Compute logits using ORACLE_SLOT_STUDENT with a fixed slot_id."""
+        prev_mode = self.adapter_mode
+        self.set_adapter_mode(ORACLE_SLOT_STUDENT)
+        self.set_oracle_slot_id(slot_id)
+        try:
+            return self.forward(images)["logits"]
+        finally:
+            self.set_adapter_mode(prev_mode)
+
+    def compute_current_slot_logits(self, images: Tensor, slot_id: int) -> Tensor:
+        """Compute logits using CURRENT_SLOT_STUDENT with a fixed active slot_id."""
+        prev_mode = self.adapter_mode
+        self.set_adapter_mode(CURRENT_SLOT_STUDENT)
+        self.set_active_slot_id(slot_id)
+        try:
+            return self.forward(images)["logits"]
+        finally:
+            self.set_adapter_mode(prev_mode)
+
+    def compute_key_slot_logits(self, images: Tensor) -> Tensor:
+        """Compute logits using KEY_SLOT_STUDENT (nearest slot key)."""
+        prev_mode = self.adapter_mode
+        self.set_adapter_mode(KEY_SLOT_STUDENT)
+        try:
+            return self.forward(images)["logits"]
         finally:
             self.set_adapter_mode(prev_mode)
