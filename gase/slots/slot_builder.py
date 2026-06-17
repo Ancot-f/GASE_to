@@ -75,9 +75,12 @@ class SlotBuilder:
         P, R = self.estimate_slot_bases(h_chart, delta_teacher)
         b = delta_teacher.mean(dim=0)  # [D]
 
-        # key and key_var from P-space projection
+        # key and key_var from P-space projection (legacy, for ablation)
         h_centered = h_chart - chart_state.mu.unsqueeze(0)
         key, key_var = self.compute_slot_key_with_var(h_centered, P)
+
+        # Phase-7.5: router_key in shared Q-space
+        router_key, router_var = self.compute_router_key(h_chart, chart_state)
 
         slot_state = SlotState(
             slot_id=slot_id,
@@ -91,6 +94,9 @@ class SlotBuilder:
             b=b.clone().detach(),
             key=key.clone().detach(),
             key_var=key_var.clone().detach(),
+            router_key=router_key.clone().detach(),
+            router_var=router_var.clone().detach(),
+            router_support=h_chart.shape[0],
             support=h_chart.shape[0],
             quality={},
             state="active",
@@ -168,6 +174,28 @@ class SlotBuilder:
     # ------------------------------------------------------------------
     #  Future: slot compatibility evaluation (skeleton only)
     # ------------------------------------------------------------------
+
+    def compute_router_key(
+        self, h_chart: Tensor, chart_state: ChartState,
+    ) -> Tuple[Tensor, Tensor]:
+        """
+        Compute routing key in shared chart routing basis Q_router.
+
+        Q_router defaults to chart.U (shared tangent coordinate).
+        All slots share the same Q_router, making distances comparable.
+        """
+        Q = chart_state.Q_router
+        if Q is None:
+            Q = chart_state.U
+            chart_state.Q_router = Q
+            chart_state.router_rank = Q.shape[1] if Q is not None else 0
+        if Q is None:
+            return torch.zeros(1, device=h_chart.device), torch.ones(1, device=h_chart.device)
+        X = h_chart - chart_state.mu.unsqueeze(0)
+        z = X @ Q
+        key = z.mean(dim=0)
+        var = z.var(dim=0, unbiased=False) + 1e-6
+        return key, var
 
     def evaluate_slot_compatibility(
         self,

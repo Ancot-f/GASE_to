@@ -22,6 +22,7 @@ from .gase_components import (
     DISTILL, INFER,
     L9_CHART_STUDENT, SEQUENTIAL_CHART_STUDENT,
     CURRENT_SLOT_STUDENT, ORACLE_SLOT_STUDENT, KEY_SLOT_STUDENT,
+    PATH_KEY_SLOT_STUDENT,
 )
 from gase.adapters.adapter_factory import build_task_adapter
 
@@ -30,6 +31,7 @@ _ALL_MODES = (
     DISTILL, INFER,
     L9_CHART_STUDENT, SEQUENTIAL_CHART_STUDENT,
     CURRENT_SLOT_STUDENT, ORACLE_SLOT_STUDENT, KEY_SLOT_STUDENT,
+    PATH_KEY_SLOT_STUDENT,
 )
 
 
@@ -221,12 +223,45 @@ class ViTGASE(nn.Module):
             self.set_adapter_mode(prev_mode)
 
     def compute_key_slot_logits(self, images: Tensor) -> Tensor:
+        self._clear_path_slot_ids()
         prev_mode = self.adapter_mode
         self.set_adapter_mode(KEY_SLOT_STUDENT)
         try:
             return self.forward(images)["logits"]
         finally:
             self.set_adapter_mode(prev_mode)
+
+    def compute_path_key_slot_logits(self, images: Tensor) -> Tensor:
+        """Forward with PATH_KEY_SLOT_STUDENT: L9 decides path, L10/L11 follow."""
+        self._clear_path_slot_ids()
+        prev_mode = self.adapter_mode
+        self.set_adapter_mode(PATH_KEY_SLOT_STUDENT)
+        try:
+            out = self.forward(images)
+            # Propagate L9's path_slot_id to L10/L11
+            first_atlas = min(self.atlas_layers)
+            l9_blk = self.blocks[first_atlas]
+            if hasattr(l9_blk, "path_slot_id") and l9_blk.path_slot_id is not None:
+                for lid in self.atlas_layers:
+                    if lid > first_atlas:
+                        self.blocks[lid].path_slot_id = l9_blk.path_slot_id
+            return out["logits"]
+        finally:
+            self.set_adapter_mode(prev_mode)
+
+    def _clear_path_slot_ids(self) -> None:
+        for blk in self.blocks:
+            if isinstance(blk, GASEAtlasBlock):
+                blk.path_slot_id = None
+
+    def collect_last_routing_info(self) -> Dict[int, any]:
+        """Collect last_routing_info from each atlas layer after forward."""
+        info = {}
+        for lid in self.atlas_layers:
+            blk = self.blocks[lid]
+            if hasattr(blk, "last_routing_info") and blk.last_routing_info is not None:
+                info[lid] = blk.last_routing_info
+        return info
 
     def compute_student_logits(self, images: Tensor) -> Tensor:
         prev_mode = self.adapter_mode

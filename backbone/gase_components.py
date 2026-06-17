@@ -16,6 +16,7 @@ SEQUENTIAL_CHART_STUDENT = "sequential_chart_student"
 CURRENT_SLOT_STUDENT = "current_slot_student"
 ORACLE_SLOT_STUDENT = "oracle_slot_student"
 KEY_SLOT_STUDENT = "key_slot_student"
+PATH_KEY_SLOT_STUDENT = "path_key_slot_student"
 
 # Chart state constants
 CHART_CANDIDATE = "candidate"

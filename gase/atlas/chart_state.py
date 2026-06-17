@@ -50,6 +50,10 @@ class ChartState:
     n_support: int = 0
     age: int = 0
     hit_count: int = 0
+    # Phase-7.5: shared routing basis
+    Q_router: Optional[Tensor] = None       # [D, r_q]
+    router_eigvals: Optional[Tensor] = None # [r_q]
+    router_rank: int = 0
     reuse_count: int = 0
     state: str = "candidate"
     slot_ids: List[int] = field(default_factory=list)

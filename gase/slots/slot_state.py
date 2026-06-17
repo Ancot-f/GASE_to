@@ -49,6 +49,9 @@ class SlotState:
     b: Optional[Tensor] = None
     key: Optional[Tensor] = None
     key_var: Optional[Tensor] = None
+    router_key: Optional[Tensor] = None      # [r_q] shared Q-space key
+    router_var: Optional[Tensor] = None      # [r_q] shared Q-space variance
+    router_support: int = 0
     support: int = 0
     quality: Dict[str, float] = field(default_factory=dict)
     state: str = "candidate"

@@ -6,7 +6,7 @@ Phase-6.5: L0-L11 all wrapped as GASEAtlasBlock.
   L9-L11: task_adapter → chart/slot/chart_adapter/free_adapter
 """
 
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 from torch import Tensor
@@ -17,6 +17,7 @@ from .gase_components import (
     DISTILL, INFER,
     L9_CHART_STUDENT, SEQUENTIAL_CHART_STUDENT,
     CURRENT_SLOT_STUDENT, ORACLE_SLOT_STUDENT, KEY_SLOT_STUDENT,
+    PATH_KEY_SLOT_STUDENT,
     RoutingOutput,
 )
 
@@ -25,6 +26,7 @@ _VALID_MODES = (
     DISTILL, INFER,
     L9_CHART_STUDENT, SEQUENTIAL_CHART_STUDENT,
     CURRENT_SLOT_STUDENT, ORACLE_SLOT_STUDENT, KEY_SLOT_STUDENT,
+    PATH_KEY_SLOT_STUDENT,
 )
 
 
@@ -56,6 +58,8 @@ class GASEAtlasBlock(nn.Module):
         self.adapter_mode: str = INFER
         self.active_slot_id: Optional[int] = None
         self.oracle_slot_id: Optional[int] = None
+        self.path_slot_id: Optional[Tensor] = None  # [B] for PATH_KEY_SLOT_STUDENT
+        self.last_routing_info: Optional[Dict[str, Any]] = None
 
         routing_cfg = config.get("routing", {})
         self.use_free_adapter: bool = config.get("free_adapter", {}).get("enabled", True)
@@ -119,16 +123,34 @@ class GASEAtlasBlock(nn.Module):
                     delta = self._apply_chart_free_combined(h_chart, sid)
                     x = self.add_delta_to_cls(x, delta)
 
-        # --- KEY_SLOT_STUDENT: base + key-selected slot ---
+        # --- KEY_SLOT_STUDENT: per-sample key-selected slot ---
         elif mode == KEY_SLOT_STUDENT:
             if self.is_base_layer and self.base_adapter is not None:
                 delta = self.apply_base_adapter(h_chart)
                 x = self.add_delta_to_cls(x, delta)
             elif self.is_atlas_layer:
-                slot_ids = self.select_slot_by_key(h_chart, chart_id=0)
-                if slot_ids is not None:
-                    majority = int(torch.mode(slot_ids).values.item())
-                    delta = self._apply_chart_free_combined(h_chart, majority)
+                routing = self.select_slots_per_sample_by_key(h_chart, chart_id=0)
+                selected = routing["slot_ids"]
+                delta = self.apply_chart_adapters_per_sample(h_chart, selected, chart_id=0)
+                self.last_routing_info = routing
+                x = self.add_delta_to_cls(x, delta)
+
+        # --- PATH_KEY_SLOT_STUDENT: L9 decides path, L10/L11 follow ---
+        elif mode == PATH_KEY_SLOT_STUDENT:
+            if self.is_base_layer and self.base_adapter is not None:
+                delta = self.apply_base_adapter(h_chart)
+                x = self.add_delta_to_cls(x, delta)
+            elif self.is_atlas_layer:
+                if self.path_slot_id is not None:
+                    # Follow L9-decided path
+                    delta = self.apply_chart_adapters_per_sample(h_chart, self.path_slot_id, chart_id=0)
+                    x = self.add_delta_to_cls(x, delta)
+                else:
+                    # L9: decide the path
+                    routing = self.select_slots_per_sample_by_key(h_chart, chart_id=0)
+                    self.last_routing_info = routing
+                    self.path_slot_id = routing["slot_ids"]
+                    delta = self.apply_chart_adapters_per_sample(h_chart, self.path_slot_id, chart_id=0)
                     x = self.add_delta_to_cls(x, delta)
 
         # --- SEQUENTIAL_CHART_STUDENT / L9_CHART_STUDENT (legacy) ---
@@ -278,6 +300,50 @@ class GASEAtlasBlock(nn.Module):
                 except ValueError:
                     pass
         return sorted(ids)
+
+    # ==================================================================
+    #  Per-sample slot routing (Phase-7)
+    # ==================================================================
+
+    def select_slots_per_sample_by_key(
+        self, h_chart: Tensor, chart_id: int = 0,
+    ) -> Dict[str, Any]:
+        """Select a slot for each sample independently using KeySlotRouter."""
+        cs = self.chart_states.get(chart_id)
+        if cs is None or getattr(cs, "mu", None) is None:
+            return {"slot_ids": torch.zeros(h_chart.shape[0], dtype=torch.long, device=h_chart.device),
+                    "entropy": torch.zeros(h_chart.shape[0], device=h_chart.device),
+                    "margin": torch.full([h_chart.shape[0]], float("inf"), device=h_chart.device),
+                    "slot_id_list": []}
+        available = self.get_available_slot_ids(chart_id)
+        slot_states: Dict[int, object] = {}
+        for sid in available:
+            ss = self.slot_states.get(f"{chart_id}_{sid}")
+            if ss is not None and getattr(ss, "key", None) is not None:
+                slot_states[sid] = ss
+        if not slot_states:
+            return {"slot_ids": torch.zeros(h_chart.shape[0], dtype=torch.long, device=h_chart.device),
+                    "entropy": torch.zeros(h_chart.shape[0], device=h_chart.device),
+                    "margin": torch.full([h_chart.shape[0]], float("inf"), device=h_chart.device),
+                    "slot_id_list": []}
+        from gase.routing.key_router import KeySlotRouter
+        router = KeySlotRouter(temperature=1.0, use_mahalanobis=True)
+        return router.route(h_chart, cs, slot_states)
+
+    def apply_chart_adapters_per_sample(
+        self, h_chart: Tensor, selected_slot_ids: Tensor, chart_id: int = 0,
+    ) -> Tensor:
+        """Apply different chart+free adapters per sample, scatter back to batch order."""
+        assert selected_slot_ids.shape[0] == h_chart.shape[0]
+        B, D = h_chart.shape
+        delta = torch.zeros(B, D, device=h_chart.device, dtype=h_chart.dtype)
+        for sid in selected_slot_ids.unique().tolist():
+            mask = selected_slot_ids == sid
+            if mask.sum() == 0:
+                continue
+            delta[mask] = (self.apply_chart_adapter_by_slot(h_chart[mask], chart_id, sid)
+                           + self.apply_free_adapter_by_slot(h_chart[mask], sid))
+        return delta
 
     # ==================================================================
     #  Slot id setters

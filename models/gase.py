@@ -106,8 +106,9 @@ class GASELearner(BaseLearner):
         if self._cur_task == 0:
             from backbone.linears import CosineLinear
             self._network.backbone.head = CosineLinear(
-                self._network.backbone.embed_dim, data_manager.nb_classes
+                self._network.backbone.embed_dim, data_manager.nb_classes, sigma=True
             )
+            self._network.backbone.head.sigma.data.fill_(16.0)  # cosine needs high sigma
 
         self._total_classes = self._known_classes + data_manager.get_task_size(self._cur_task)
         logging.info("Learning on {}-{}".format(self._known_classes, self._total_classes))
@@ -399,6 +400,7 @@ class GASELearner(BaseLearner):
                 )
                 self.evaluate_oracle_slot_student(self.test_loader)
                 self.evaluate_key_slot_student(self.test_loader)
+                self.evaluate_path_key_slot_student(self.test_loader)
 
     # ==================================================================
     #  Reports (minimal debug versions)
@@ -644,13 +646,11 @@ class GASELearner(BaseLearner):
 
     def evaluate_key_slot_student(self, data_loader) -> Dict:
         """
-        Evaluate using nearest slot key (KEY_SLOT_STUDENT mode).
+        Evaluate using per-sample key slot routing (KEY_SLOT_STUDENT mode).
 
-        Phase-6: uses batch-majority nearest slot.
-        Per-sample mixed routing will be Phase-7.
+        Phase-7: each sample independently selects the nearest slot
+        via Mahalanobis distance in P-space.
         """
-        logging.info("[KeySlotEval] using batch-majority nearest slot key")
-
         backbone = self._network.backbone
         backbone.eval()
 
@@ -669,12 +669,46 @@ class GASELearner(BaseLearner):
         y_true = np.concatenate(all_labels_list)
         result = self._evaluate(y_pred, y_true)
 
-        logging.info("[KeySlotEval] total=%.2f", result["top1"])
+        logging.info("[PerSampleKeySlotEval] total=%.2f", result["top1"])
         for key, val in sorted(result["grouped"].items()):
             if "-" in key:
-                logging.info("[KeySlotEval] %s=%.2f", key, val)
+                logging.info("[PerSampleKeySlotEval] %s=%.2f", key, val)
 
         self.phase6_key_eval = result
+        return result
+
+    # ------------------------------------------------------------------
+    #  Phase-7.5: Path-level consistent slot routing eval
+    # ------------------------------------------------------------------
+
+    def evaluate_path_key_slot_student(self, data_loader) -> Dict:
+        """
+        Task-agnostic path-level consistent routing.
+        L9 selects slot per sample via shared Q-space router_key,
+        L10/L11 follow the same slot.
+        """
+        backbone = self._network.backbone
+        backbone.eval()
+
+        all_preds, all_labels_list = [], []
+
+        with torch.no_grad():
+            for _, inputs, targets in data_loader:
+                inputs = inputs.to(self._device)
+                logits = backbone.compute_path_key_slot_logits(inputs)
+                logits = logits[:, :self._total_classes]
+                topk_preds = torch.topk(logits, k=self.topk, dim=1, largest=True, sorted=True)[1]
+                all_preds.append(topk_preds.cpu().numpy())
+                all_labels_list.append(targets.cpu().numpy())
+
+        y_pred = np.concatenate(all_preds)
+        y_true = np.concatenate(all_labels_list)
+        result = self._evaluate(y_pred, y_true)
+
+        logging.info("[PathKeySlotEval] total=%.2f", result["top1"])
+        for key, val in sorted(result["grouped"].items()):
+            if "-" in key:
+                logging.info("[PathKeySlotEval] %s=%.2f", key, val)
         return result
 
     # ------------------------------------------------------------------
