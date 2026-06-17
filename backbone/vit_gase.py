@@ -1,13 +1,13 @@
 """
 ViTGASE: ViT backbone wrapper for GASE-Atlas continual learning.
 
-Wraps a standard timm ViT and injects:
-- SEMA-style frozen functional adapters at L0-L8
-- GASEAtlasBlocks at L9-L11 (atlas_layers).
-
-Does NOT modify vit_sema.py — this is an independent GASE backbone.
+Phase-6.5: L0-L11 all wrapped as GASEAtlasBlock.
+  L0-L8: base_adapter (frozen after Task0), no chart/slot
+  L9-L11: task_adapter → chart/slot/chart_adapter/free_adapter
 """
 
+import copy
+import logging
 import math
 from typing import Dict, List, Optional, Tuple
 
@@ -18,92 +18,23 @@ import timm
 
 from .gase_block import GASEAtlasBlock
 from .gase_components import (
-    TASK_TRAIN, DISTILL, INFER,
+    TASK_TRAIN, TASK0_BOOTSTRAP, BASE_PLUS_TASK_TRAIN,
+    DISTILL, INFER,
+    L9_CHART_STUDENT, SEQUENTIAL_CHART_STUDENT,
+    CURRENT_SLOT_STUDENT, ORACLE_SLOT_STUDENT, KEY_SLOT_STUDENT,
+)
+from gase.adapters.adapter_factory import build_task_adapter
+
+_ALL_MODES = (
+    TASK_TRAIN, TASK0_BOOTSTRAP, BASE_PLUS_TASK_TRAIN,
+    DISTILL, INFER,
     L9_CHART_STUDENT, SEQUENTIAL_CHART_STUDENT,
     CURRENT_SLOT_STUDENT, ORACLE_SLOT_STUDENT, KEY_SLOT_STUDENT,
 )
 
 
-class SEMAStyleAdapterBlock(nn.Module):
-    """
-    SEMA-identical functional adapter block for L0-L8.
-
-    Replicates SEMA's Block.forward (vit_sema.py:87-107) exactly:
-      x = x + attn(norm1(x))           # attention residual
-      adapt_x = adapter(x)             # on FULL [B,N,D] → down→ReLU→up
-      residual = x                     # save attention output
-      x = mlp(norm2(x))                # MLP
-      x = x + adapt_x                  # parallel adapter
-      x = residual + x                 # final residual
-
-    The adapter matches SEMA's Adapter class: down_proj→ReLU→up_proj,
-    bias=True, init=lora (kaiming down, zeros up+bias).
-    No dropout or scale in forward (matches SEMA Adapter.forward).
-    """
-
-    def __init__(self, timm_block: nn.Module, dim: int, bottleneck: int = 16):
-        super().__init__()
-        self.dim = dim
-
-        # Extract components from timm block
-        self.norm1 = timm_block.norm1
-        self.attn = timm_block.attn
-        self.drop_path = getattr(timm_block, 'drop_path1',
-                                 getattr(timm_block, 'drop_path', nn.Identity()))
-        self.norm2 = timm_block.norm2
-        self.mlp = timm_block.mlp
-        self.drop_path2 = getattr(timm_block, 'drop_path2', nn.Identity())
-
-        # SEMA-identical adapter: D→bottleneck→D, bias=True
-        self.down_proj = nn.Linear(dim, bottleneck, bias=True)
-        self.act = nn.ReLU()
-        self.up_proj = nn.Linear(bottleneck, dim, bias=True)
-
-        # SEMA-identical init (init_option="lora")
-        nn.init.kaiming_uniform_(self.down_proj.weight, a=math.sqrt(5))
-        nn.init.zeros_(self.down_proj.bias)
-        nn.init.zeros_(self.up_proj.weight)
-        nn.init.zeros_(self.up_proj.bias)
-
-    def forward(self, x: Tensor) -> Tensor:
-        # 1. Attention residual (line 88 in sema Block.forward)
-        x = x + self.drop_path(self.attn(self.norm1(x)))
-
-        # 2. Adapter on FULL attention output [B, N, D] (line 89-90)
-        adapt_x = self.up_proj(self.act(self.down_proj(x)))
-
-        # 3. Save residual (line 92)
-        residual = x
-
-        # 4. MLP (lines 93-94)
-        x = self.norm2(x)
-        x = self.drop_path2(self.mlp(x))
-
-        # 5. Parallel: add adapter to MLP output (line 101)
-        x = x + adapt_x
-
-        # 6. Residual connection (line 105)
-        x = residual + x
-        return x
-
-
 class ViTGASE(nn.Module):
-    """
-    ViT wrapper with GASE atlas augmentation.
-
-    Uses timm to load a pretrained ViT, then replaces blocks at
-    atlas_layers with GASEAtlasBlock wrappers. The original ViT block
-    is preserved inside each GASEAtlasBlock as original_block.
-
-    Attributes:
-        backbone_name: timm model name (e.g. "vit_base_patch16_224").
-        embed_dim: feature dimension D (default 768).
-        atlas_layers: list of layer indices with GASE blocks.
-        blocks: ModuleList of all ViT blocks (some wrapped as GASEAtlasBlock).
-        head: final linear classifier.
-        adapter_mode: current adapter mode for all GASE blocks.
-        out_dim: output feature dimension.
-    """
+    """ViT wrapper with GASE atlas + base adapter augmentation."""
 
     def __init__(
         self,
@@ -113,20 +44,14 @@ class ViTGASE(nn.Module):
         atlas_layers: Optional[List[int]] = None,
         config: Optional[dict] = None,
     ):
-        """
-        Args:
-            backbone_name: timm ViT model name.
-            num_classes: number of output classes.
-            embed_dim: feature dimension D.
-            atlas_layers: list of layer indices to augment with GASE.
-            config: GASE configuration dict.
-        """
         super().__init__()
         self.backbone_name = backbone_name
         self.num_classes = num_classes
         self.embed_dim = embed_dim
-        self.atlas_layers = atlas_layers or [9, 10, 11]
         self.config = config or {}
+        self.atlas_layers = atlas_layers or [9, 10, 11]
+        self.base_adapter_layers = self.config.get("base_adapter_layers", [0, 1, 2, 3, 4, 5, 6, 7, 8])
+        self.bootstrap_adapter_layers = self.config.get("bootstrap_adapter_layers", list(range(12)))
         self.adapter_mode: str = INFER
         self.out_dim: int = embed_dim
 
@@ -137,22 +62,9 @@ class ViTGASE(nn.Module):
     # ------------------------------------------------------------------
 
     def build_backbone(self) -> None:
-        """
-        Build the ViT backbone via timm and inject GASE blocks at atlas_layers.
-
-        Creates a timm ViT without network access (pretrained=False), then
-        loads weights from a local safetensors checkpoint if available.
-        Replaces blocks at self.atlas_layers with GASEAtlasBlock wrappers.
-        """
-        # Build ViT without downloading (weights loaded from local file)
-        base_vit = timm.create_model(
-            self.backbone_name, pretrained=False, num_classes=0
-        )
-
-        # Try to load pretrained weights from local checkpoint
+        base_vit = timm.create_model(self.backbone_name, pretrained=False, num_classes=0)
         pretrained_path = self.config.get(
-            "pretrained_path",
-            "/sdd1/syc/My_code/common/pre-model/1k/model.safetensors",
+            "pretrained_path", "/sdd1/syc/My_code/common/pre-model/1k/model.safetensors",
         )
         self._load_pretrained_weights(base_vit, pretrained_path)
 
@@ -163,161 +75,68 @@ class ViTGASE(nn.Module):
         self.norm = base_vit.norm
         self.pre_logits = getattr(base_vit, "pre_logits", nn.Identity())
 
-        # Build block list
-        # L0-L8: SEMA-style frozen functional adapter block
-        # L9-L11: GASEAtlasBlock (task_adapter / chart_adapter)
+        # L0-L11 all wrapped as GASEAtlasBlock
         num_blocks = len(base_vit.blocks)
         self.blocks = nn.ModuleList()
         for i in range(num_blocks):
             orig_blk = base_vit.blocks[i]
-            if i in self.atlas_layers:
-                gase_blk = GASEAtlasBlock(orig_blk, layer_id=i, dim=self.embed_dim, config=self.config)
-                self.blocks.append(gase_blk)
-            else:
-                self.blocks.append(orig_blk)  # plain timm block, no adapter
+            gase_blk = GASEAtlasBlock(orig_blk, layer_id=i, dim=self.embed_dim, config=self.config)
+            self.blocks.append(gase_blk)
 
-        # Classifier head
         self.head = nn.Linear(self.embed_dim, self.num_classes) if self.num_classes > 0 else nn.Identity()
-
-        # Free base_vit reference so it can be GC'd (we extracted what we need)
         del base_vit
 
     def _load_pretrained_weights(self, model: nn.Module, path: str) -> None:
-        """
-        Load pretrained weights from a local safetensors file.
-
-        The checkpoint keys match timm's internal ViT block format directly
-        (fused qkv, mlp.fc1/fc2), so no remapping is needed.
-
-        Args:
-            model: timm ViT model with randomly initialized weights.
-            path: path to .safetensors checkpoint.
-        """
         import os
         from safetensors.torch import load_file as safetensors_load
-
         if not os.path.exists(path):
             print(f"[ViTGASE] Pretrained weights not found at {path}, using random init.")
             return
-
         state_dict = safetensors_load(path)
-
-        # Load with strict=False: head, patch_embed, pos_embed may differ
         msg = model.load_state_dict(state_dict, strict=False)
         print(f"[ViTGASE] Loaded pretrained weights from {path}")
-        if msg.missing_keys:
-            print(f"[ViTGASE] Missing keys ({len(msg.missing_keys)}): "
-                  f"{msg.missing_keys[:3]}...")
-        if msg.unexpected_keys:
-            print(f"[ViTGASE] Unexpected keys ({len(msg.unexpected_keys)}): "
-                  f"{msg.unexpected_keys[:3]}...")
 
     # ------------------------------------------------------------------
     #  Forward
     # ------------------------------------------------------------------
 
     def forward(self, x: Tensor) -> Dict[str, Tensor]:
-        """
-        Full forward pass: patch embed -> blocks -> norm -> CLS -> head.
-
-        Args:
-            x: input images of shape [B, C, H, W].
-
-        Returns:
-            Dict with keys "features" (pre-logits CLS token [B, D])
-            and "logits" [B, num_classes].
-        """
         features = self.forward_features(x)
         logits = self.head(features)
         return {"features": features, "logits": logits}
 
     def forward_features(self, x: Tensor) -> Tensor:
-        """
-        Extract CLS-token features through all blocks and final norm.
-
-        Args:
-            x: input images [B, C, H, W].
-
-        Returns:
-            CLS-token features of shape [B, D].
-        """
         B = x.shape[0]
         x = self.patch_embed(x)
         cls_tokens = self.cls_token.expand(B, -1, -1)
         x = torch.cat((cls_tokens, x), dim=1)
         x = x + self.pos_embed
         x = self.pos_drop(x)
-
         for blk in self.blocks:
-            if isinstance(blk, GASEAtlasBlock):
-                x, _routing = blk(x)
-            else:
-                x = blk(x)
-
+            x, _routing = blk(x)
         x = self.norm(x)
         x = self.pre_logits(x[:, 0])
         return x
 
     def forward_until_layer(self, x: Tensor, layer_id: int) -> Tensor:
-        """
-        Forward pass through blocks 0..layer_id (inclusive).
-
-        Args:
-            x: input images [B, C, H, W].
-            layer_id: last layer to process (0-indexed).
-
-        Returns:
-            Hidden states after layer_id of shape [B, N, D].
-        """
         B = x.shape[0]
         x = self.patch_embed(x)
         cls_tokens = self.cls_token.expand(B, -1, -1)
         x = torch.cat((cls_tokens, x), dim=1)
         x = x + self.pos_embed
         x = self.pos_drop(x)
-
         for i, blk in enumerate(self.blocks):
-            if isinstance(blk, GASEAtlasBlock):
-                x, _routing = blk(x)
-            else:
-                x = blk(x)
+            x, _routing = blk(x)
             if i == layer_id:
                 break
         return x
-
-    def forward_from_layer(self, h: Tensor, start_layer_id: int) -> Tensor:
-        """
-        Forward pass from start_layer_id through remaining blocks and norm.
-
-        Args:
-            h: hidden states [B, N, D].
-            start_layer_id: first layer to process.
-
-        Returns:
-            CLS-token features of shape [B, D].
-        """
-        for i in range(start_layer_id, len(self.blocks)):
-            blk = self.blocks[i]
-            if isinstance(blk, GASEAtlasBlock):
-                h, _routing = blk(h)
-            else:
-                h = blk(h)
-        h = self.norm(h)
-        return h[:, 0]
 
     # ------------------------------------------------------------------
     #  Adapter mode
     # ------------------------------------------------------------------
 
     def set_adapter_mode(self, mode: str) -> None:
-        """
-        Set adapter mode on all GASE blocks.
-
-        Args:
-            mode: one of TASK_TRAIN, DISTILL, INFER.
-        """
-        if mode not in (TASK_TRAIN, DISTILL, INFER, L9_CHART_STUDENT, SEQUENTIAL_CHART_STUDENT,
-                        CURRENT_SLOT_STUDENT, ORACLE_SLOT_STUDENT, KEY_SLOT_STUDENT):
+        if mode not in _ALL_MODES:
             raise ValueError(f"Unknown adapter_mode: {mode}")
         self.adapter_mode = mode
         for blk in self.blocks:
@@ -325,173 +144,70 @@ class ViTGASE(nn.Module):
                 blk.set_adapter_mode(mode)
 
     def enable_task_adapters(self) -> None:
-        """Enable task-adapter mode on all GASE blocks."""
         self.set_adapter_mode(TASK_TRAIN)
 
     def disable_task_adapters(self) -> None:
-        """Switch to inference mode (disable task-adapters)."""
         self.set_adapter_mode(INFER)
 
     # ------------------------------------------------------------------
-    #  Parameter management
+    #  Base adapter management (Phase-6.5)
     # ------------------------------------------------------------------
 
-    def freeze_backbone(self) -> None:
-        """Freeze all parameters except task adapters and head."""
-        for p in self.parameters():
-            p.requires_grad = False
-
-    def unfreeze_task_adapters(self) -> None:
-        """Unfreeze only task-adapter parameters."""
-        for blk in self.blocks:
-            if isinstance(blk, GASEAtlasBlock) and blk.task_adapter is not None:
-                for p in blk.task_adapter.parameters():
-                    p.requires_grad = True
-
-    def unfreeze_head(self) -> None:
-        """Unfreeze classifier head."""
-        for p in self.head.parameters():
-            p.requires_grad = True
-
-    def freeze_permanent_adapters(self) -> None:
-        """Freeze chart adapters, free adapters, routers (not task adapters)."""
-        for blk in self.blocks:
-            if isinstance(blk, GASEAtlasBlock):
-                for adapter in blk.chart_adapters.values():
-                    for p in adapter.parameters():
-                        p.requires_grad = False
-                if blk.free_adapter is not None:
-                    for p in blk.free_adapter.parameters():
-                        p.requires_grad = False
-
-    # ------------------------------------------------------------------
-    #  Accessors
-    # ------------------------------------------------------------------
-
-    def get_atlas_blocks(self) -> List[GASEAtlasBlock]:
-        """Return all GASEAtlasBlock instances."""
-        return [blk for blk in self.blocks if isinstance(blk, GASEAtlasBlock)]
-
-    def get_block(self, layer_id: int) -> nn.Module:
-        """Get a block by layer index."""
-        if layer_id < 0 or layer_id >= len(self.blocks):
-            raise IndexError(f"layer_id {layer_id} out of range [0, {len(self.blocks)})")
-        return self.blocks[layer_id]
-
-    # ------------------------------------------------------------------
-    #  Feature extraction for collection (Phase-3)
-    # ------------------------------------------------------------------
-
-    def extract_layer_chart_feature_and_teacher(
-        self,
-        images: Tensor,
-        layer_id: int,
-    ) -> Tuple[Tensor, Tensor]:
+    def commit_task0_base_adapters(self) -> None:
         """
-        Extract h_chart and task-adapter teacher residual for a target GASE layer.
-
-        Uses sequential_chart_student mode so that lower layers with committed
-        chart-adapters produce student-path features. The target layer's
-        extract_h_chart_and_delta_teacher is called WITHOUT adding the
-        residual back to the block output.
-
-        Phase-5: supports L9, L10, L11. Lower layers must have chart-adapters
-        registered before collecting higher layers.
-
-        Args:
-            images: input images of shape [B, 3, H, W].
-            layer_id: target GASE layer index (9, 10, or 11).
-
-        Returns:
-            h_chart: pre-adapter CLS feature of shape [B, D]
-                     (permanent/student path, NOT task-adapter path).
-            delta_teacher: task_adapter(h_chart) of shape [B, D].
+        Copy L0-L8 task_adapter → base_adapter, freeze base_adapter,
+        remove task_adapter from L0-L8.
         """
-        if layer_id not in self.atlas_layers:
-            raise ValueError(
-                f"layer_id {layer_id} is not a GASE atlas layer. "
-                f"atlas_layers={self.atlas_layers}"
-            )
+        logging.info("[ViTGASE] Committing base adapters for layers %s", self.base_adapter_layers)
+        for lid in self.base_adapter_layers:
+            blk = self.blocks[lid]
+            if blk.task_adapter is not None:
+                blk.set_base_adapter(copy.deepcopy(blk.task_adapter), freeze=True)
+                blk.task_adapter = None
+        logging.info("[ViTGASE] Base adapters committed and frozen.")
 
-        # Temporarily use sequential_chart_student for prefix layers
-        prev_mode = self.adapter_mode
-        self.set_adapter_mode(SEQUENTIAL_CHART_STUDENT)
-        try:
-            B = images.shape[0]
-            x = self.patch_embed(images)
-            cls_tokens = self.cls_token.expand(B, -1, -1)
-            x = torch.cat((cls_tokens, x), dim=1)
-            x = x + self.pos_embed
-            x = self.pos_drop(x)
-
-            for i, blk in enumerate(self.blocks):
-                if i == layer_id:
-                    if not isinstance(blk, GASEAtlasBlock):
-                        raise TypeError(
-                            f"Block at layer {layer_id} is {type(blk).__name__}, "
-                            f"expected GASEAtlasBlock."
-                        )
-                    _block_output, h_chart, delta_teacher = blk.extract_h_chart_and_delta_teacher(x)
-                    return h_chart, delta_teacher
-                else:
-                    if isinstance(blk, GASEAtlasBlock):
-                        x, _routing = blk(x)
-                    else:
-                        x = blk(x)
-
-            raise RuntimeError(f"Layer {layer_id} not reached in blocks loop.")
-        finally:
-            self.set_adapter_mode(prev_mode)
-
-    def compute_teacher_logits(self, images: Tensor) -> Tensor:
-        """
-        Compute logits using the current task-adapter teacher path.
-
-        Temporarily switches to task_train mode, runs full forward pass,
-        and restores the original adapter mode.
-
-        Args:
-            images: input images of shape [B, 3, H, W].
-
-        Returns:
-            Teacher logits of shape [B, num_classes].
-        """
-        prev_mode = self.adapter_mode
-        self.set_adapter_mode(TASK_TRAIN)
-        try:
-            out = self.forward(images)
-            return out["logits"]
-        finally:
-            self.set_adapter_mode(prev_mode)
-
-    def compute_student_logits(self, images: Tensor) -> Tensor:
-        """Compute logits using the sequential chart-adapter student path."""
-        prev_mode = self.adapter_mode
-        self.set_adapter_mode(SEQUENTIAL_CHART_STUDENT)
-        try:
-            out = self.forward(images)
-            return out["logits"]
-        finally:
-            self.set_adapter_mode(prev_mode)
+    def freeze_base_adapters(self) -> None:
+        for lid in self.base_adapter_layers:
+            self.blocks[lid].freeze_base_adapter()
 
     # ------------------------------------------------------------------
-    #  Slot management (Phase-6)
+    #  Task adapter creation
+    # ------------------------------------------------------------------
+
+    def create_task_adapters_for_layers(self, layer_ids: List[int]) -> None:
+        dim = self.embed_dim
+        for lid in layer_ids:
+            blk = self.blocks[lid]
+            blk.task_adapter = build_task_adapter(self.config, dim)
+        logging.info("[ViTGASE] Created task_adapters for layers %s", layer_ids)
+
+    # ------------------------------------------------------------------
+    #  Slot management
     # ------------------------------------------------------------------
 
     def set_active_slot_id(self, slot_id: Optional[int]) -> None:
-        """Set active slot id on all GASE blocks."""
         for blk in self.blocks:
             if isinstance(blk, GASEAtlasBlock):
                 blk.set_active_slot_id(slot_id)
 
     def set_oracle_slot_id(self, slot_id: Optional[int]) -> None:
-        """Set oracle slot id on all GASE blocks."""
         for blk in self.blocks:
             if isinstance(blk, GASEAtlasBlock):
                 blk.set_oracle_slot_id(slot_id)
 
+    # ------------------------------------------------------------------
+    #  Compute logits helpers
+    # ------------------------------------------------------------------
+
+    def compute_teacher_logits(self, images: Tensor) -> Tensor:
+        prev_mode = self.adapter_mode
+        self.set_adapter_mode(TASK_TRAIN)
+        try:
+            return self.forward(images)["logits"]
+        finally:
+            self.set_adapter_mode(prev_mode)
+
     def compute_oracle_slot_logits(self, images: Tensor, slot_id: int) -> Tensor:
-        """Compute logits using ORACLE_SLOT_STUDENT with a fixed slot_id."""
         prev_mode = self.adapter_mode
         self.set_adapter_mode(ORACLE_SLOT_STUDENT)
         self.set_oracle_slot_id(slot_id)
@@ -500,21 +216,59 @@ class ViTGASE(nn.Module):
         finally:
             self.set_adapter_mode(prev_mode)
 
-    def compute_current_slot_logits(self, images: Tensor, slot_id: int) -> Tensor:
-        """Compute logits using CURRENT_SLOT_STUDENT with a fixed active slot_id."""
-        prev_mode = self.adapter_mode
-        self.set_adapter_mode(CURRENT_SLOT_STUDENT)
-        self.set_active_slot_id(slot_id)
-        try:
-            return self.forward(images)["logits"]
-        finally:
-            self.set_adapter_mode(prev_mode)
-
     def compute_key_slot_logits(self, images: Tensor) -> Tensor:
-        """Compute logits using KEY_SLOT_STUDENT (nearest slot key)."""
         prev_mode = self.adapter_mode
         self.set_adapter_mode(KEY_SLOT_STUDENT)
         try:
             return self.forward(images)["logits"]
         finally:
             self.set_adapter_mode(prev_mode)
+
+    def compute_student_logits(self, images: Tensor) -> Tensor:
+        prev_mode = self.adapter_mode
+        self.set_adapter_mode(SEQUENTIAL_CHART_STUDENT)
+        try:
+            return self.forward(images)["logits"]
+        finally:
+            self.set_adapter_mode(prev_mode)
+
+    # ------------------------------------------------------------------
+    #  Feature extraction
+    # ------------------------------------------------------------------
+
+    def extract_layer_chart_feature_and_teacher(self, images: Tensor, layer_id: int) -> Tuple[Tensor, Tensor]:
+        """Extract h_chart + delta_teacher using CURRENT_SLOT_STUDENT for prefix."""
+        if layer_id not in self.atlas_layers:
+            raise ValueError(f"layer_id {layer_id} not in atlas_layers {self.atlas_layers}")
+
+        prev_mode = self.adapter_mode
+        self.set_adapter_mode(CURRENT_SLOT_STUDENT)
+        try:
+            B = images.shape[0]
+            x = self.patch_embed(images)
+            cls_tokens = self.cls_token.expand(B, -1, -1)
+            x = torch.cat((cls_tokens, x), dim=1)
+            x = x + self.pos_embed
+            x = self.pos_drop(x)
+            for i, blk in enumerate(self.blocks):
+                if i == layer_id:
+                    _block_output, h_chart, delta_teacher = blk.extract_h_chart_and_delta_teacher(x)
+                    return h_chart, delta_teacher
+                else:
+                    x, _routing = blk(x)
+            raise RuntimeError(f"Layer {layer_id} not reached.")
+        finally:
+            self.set_adapter_mode(prev_mode)
+
+    # ------------------------------------------------------------------
+    #  Accessors
+    # ------------------------------------------------------------------
+
+    def get_atlas_blocks(self) -> List[GASEAtlasBlock]:
+        return [self.blocks[lid] for lid in self.atlas_layers]
+
+    def get_base_blocks(self) -> List[GASEAtlasBlock]:
+        return [self.blocks[lid] for lid in self.base_adapter_layers]
+
+    def get_block(self, layer_id: int) -> nn.Module:
+        return self.blocks[layer_id]

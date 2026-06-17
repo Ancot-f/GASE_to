@@ -68,6 +68,12 @@ class GASELearner(BaseLearner):
         self.debug_max_tasks: int = args.get("debug_max_tasks", -1)
         self.stop_after_task: int = args.get("stop_after_task", -1)
 
+        # Phase-6.5: bootstrap config
+        self.task0_train_all_adapters: bool = args.get("task0_train_all_adapters", True)
+        self.freeze_base_after_task0: bool = args.get("freeze_base_after_task0", True)
+        self.bootstrap_adapter_layers: List[int] = args.get("bootstrap_adapter_layers", list(range(12)))
+        self.should_stop_training: bool = False
+
         logging.info(
             "GASELearner Phase-2 initialized. atlas_layers=%s, adapter_dim=%d",
             self.atlas_layers, self.adapter_dim,
@@ -91,9 +97,10 @@ class GASELearner(BaseLearner):
             return
         if self.debug_max_tasks > 0 and self._cur_task >= self.debug_max_tasks:
             logging.info(
-                "[GASE] debug_max_tasks=%d reached at task %d. Skipping.",
+                "[GASE] debug_max_tasks=%d reached at task %d. Stopping.",
                 self.debug_max_tasks, self._cur_task,
             )
+            self.should_stop_training = True
             return
 
         if self._cur_task == 0:
@@ -204,14 +211,27 @@ class GASELearner(BaseLearner):
     # ==================================================================
 
     def _create_task_adapters(self) -> None:
-        """Create fresh TaskAdapters for each GASE atlas layer."""
-        dim = self._network.backbone.embed_dim
-        for blk in self._network.backbone.get_atlas_blocks():
-            blk.task_adapter = build_task_adapter(self.args, dim)
-            blk.task_adapter.to(self._device)
-        logging.info(
-            "Created TaskAdapters at layers %s", self.atlas_layers
-        )
+        """Create task_adapters: Task0→L0-L11, Task1+→L9-L11."""
+        backbone = self._network.backbone
+        dim = backbone.embed_dim
+
+        if self._cur_task == 0 and self.task0_train_all_adapters:
+            layer_ids = self.bootstrap_adapter_layers
+            mode = "task0_bootstrap"
+            for lid in layer_ids:
+                blk = backbone.get_block(lid)
+                blk.task_adapter = build_task_adapter(self.args, dim)
+                blk.task_adapter.to(self._device)
+        else:
+            layer_ids = self.atlas_layers
+            mode = "base_plus_task_train"
+            for lid in layer_ids:
+                blk = backbone.get_block(lid)
+                blk.task_adapter = build_task_adapter(self.args, dim)
+                blk.task_adapter.to(self._device)
+
+        backbone.set_adapter_mode(mode)
+        logging.info("[GASE] Created task_adapters for layers %s, mode=%s", layer_ids, mode)
 
     # ==================================================================
     #  Parameter freezing
@@ -242,12 +262,12 @@ class GASELearner(BaseLearner):
         for p in backbone.head.parameters():
             p.requires_grad = True
 
-        # 4. Task0: also unfreeze L0-L8 SEMA-style adapters
-        if self._cur_task == 0:
-            from backbone.vit_gase import SEMAStyleAdapterBlock
-            for blk in backbone.blocks:
-                if isinstance(blk, SEMAStyleAdapterBlock):
-                    for p in blk.parameters():
+        # 4. Task0: unfreeze task_adapters on ALL layers (L0-L11)
+        if self._cur_task == 0 and self.task0_train_all_adapters:
+            for lid in self.bootstrap_adapter_layers:
+                blk = backbone.get_block(lid)
+                if blk.task_adapter is not None:
+                    for p in blk.task_adapter.parameters():
                         p.requires_grad = True
 
     def _log_trainable_parameters(self) -> None:
@@ -366,16 +386,19 @@ class GASELearner(BaseLearner):
                     self.phase5_report["eval"] = eval_metrics
 
         # Phase-6: multi-slot with oracle + key eval
-        if self.phase == "multi_slot_oracle":
+        if self.phase in ("multi_slot_oracle", "bootstrap_multislot_oracle"):
             if not self._check_debug_limits():
+                # Phase-6.5: Task0 → commit base adapters first
+                if self._cur_task == 0 and self.freeze_base_after_task0:
+                    logging.info("[GASE] Phase-6.5: committing Task0 base adapters...")
+                    self._network.backbone.commit_task0_base_adapters()
+
                 slot_id = self._cur_task
                 logging.info("[GASE] Phase-6: multi-slot distillation slot=%d...", slot_id)
                 self.distill_sequential_multi_slot_for_task(
                     task_id=self._cur_task, train_loader=self.train_loader,
                 )
-                # Run oracle eval (upper bound) on all seen data
                 self.evaluate_oracle_slot_student(self.test_loader)
-                # Run key-slot eval (baseline) on all seen data
                 self.evaluate_key_slot_student(self.test_loader)
 
     # ==================================================================
@@ -474,6 +497,19 @@ class GASELearner(BaseLearner):
         # Register adapter + slot (freeze=True keeps old slots frozen)
         blk.register_slot(slot_state)
         blk.register_chart_adapter(chart_id=0, slot_id=slot_id, adapter=adapter, freeze=True)
+
+        # Phase-6.5: fit free adapter for leftover residual
+        free_metrics = {}
+        if self.args.get("free_adapter", {}).get("enabled", True):
+            from gase.distill.free_distiller import FreeAdapterDistiller
+            with torch.no_grad():
+                delta_chart = adapter(h_chart, chart_state.mu)
+            free_distiller = FreeAdapterDistiller(self.args)
+            free_adapter_obj, free_metrics = free_distiller.fit_free_adapter_for_layer_slot(
+                h_chart, delta_teacher, delta_chart,
+            )
+            blk.register_free_adapter(slot_id, free_adapter_obj, freeze=True)
+            metrics.update(free_metrics)
 
         committed_slots = blk.get_available_slot_ids(0)
         logging.info(

@@ -7,6 +7,8 @@ from torch import Tensor
 
 # Adapter mode constants
 TASK_TRAIN = "task_train"
+TASK0_BOOTSTRAP = "task0_bootstrap"
+BASE_PLUS_TASK_TRAIN = "base_plus_task_train"
 DISTILL = "distill"
 INFER = "infer"
 L9_CHART_STUDENT = "l9_chart_student"
@@ -33,8 +35,6 @@ SLOT_RETIRED = "retired"
 
 @dataclass
 class ResidualOutput:
-    """Residual outputs from different adapter types for one GASE block."""
-
     delta_task: Optional[Tensor] = None
     delta_chart: Optional[Tensor] = None
     delta_free: Optional[Tensor] = None
@@ -43,8 +43,6 @@ class ResidualOutput:
 
 @dataclass
 class RoutingOutput:
-    """Routing decisions for one GASE block."""
-
     chart_probs: Optional[Tensor] = None
     slot_probs: Optional[Tensor] = None
     selected_chart_ids: Optional[Tensor] = None

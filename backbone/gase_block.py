@@ -1,8 +1,9 @@
 """
 GASEAtlasBlock: ViT transformer block augmented with GASE adapters.
 
-Phase-6: supports multi-slot storage (one chart, many slots).
-Each slot = one task. Old slots are frozen.
+Phase-6.5: L0-L11 all wrapped as GASEAtlasBlock.
+  L0-L8: base_adapter (frozen after Task0), no chart/slot
+  L9-L11: task_adapter → chart/slot/chart_adapter/free_adapter
 """
 
 from typing import Dict, List, Optional, Tuple
@@ -12,21 +13,23 @@ from torch import Tensor
 from torch import nn
 
 from .gase_components import (
-    TASK_TRAIN, DISTILL, INFER,
+    TASK_TRAIN, TASK0_BOOTSTRAP, BASE_PLUS_TASK_TRAIN,
+    DISTILL, INFER,
     L9_CHART_STUDENT, SEQUENTIAL_CHART_STUDENT,
     CURRENT_SLOT_STUDENT, ORACLE_SLOT_STUDENT, KEY_SLOT_STUDENT,
     RoutingOutput,
 )
 
 _VALID_MODES = (
-    TASK_TRAIN, DISTILL, INFER,
+    TASK_TRAIN, TASK0_BOOTSTRAP, BASE_PLUS_TASK_TRAIN,
+    DISTILL, INFER,
     L9_CHART_STUDENT, SEQUENTIAL_CHART_STUDENT,
     CURRENT_SLOT_STUDENT, ORACLE_SLOT_STUDENT, KEY_SLOT_STUDENT,
 )
 
 
 class GASEAtlasBlock(nn.Module):
-    """A ViT block augmented with GASE atlas + multi-slot capabilities."""
+    """A ViT block augmented with GASE atlas + multi-slot + base_adapter."""
 
     def __init__(self, original_block: nn.Module, layer_id: int, dim: int, config: dict):
         super().__init__()
@@ -34,13 +37,21 @@ class GASEAtlasBlock(nn.Module):
         self.dim = dim
         self.original_block = original_block
 
+        # Layer classification
+        base_layers = config.get("base_adapter_layers", [0, 1, 2, 3, 4, 5, 6, 7, 8])
+        atlas_layers = config.get("atlas_layers", [9, 10, 11])
+        self.is_base_layer: bool = layer_id in base_layers
+        self.is_atlas_layer: bool = layer_id in atlas_layers
+
+        # Adapters
+        self.base_adapter: Optional[nn.Module] = None
         self.task_adapter: Optional[nn.Module] = None
         self.chart_router: Optional[nn.Module] = None
         self.slot_router: Optional[nn.Module] = None
         self.chart_adapters: Dict[str, nn.Module] = nn.ModuleDict()
-        self.chart_states: Dict[int, object] = {}       # chart_id -> ChartState
-        self.slot_states: Dict[str, object] = {}         # "{chart_id}_{slot_id}" -> SlotState
-        self.free_adapter: Optional[nn.Module] = None
+        self.free_adapters: Dict[str, nn.Module] = nn.ModuleDict()
+        self.chart_states: Dict[int, object] = {}
+        self.slot_states: Dict[str, object] = {}
 
         self.adapter_mode: str = INFER
         self.active_slot_id: Optional[int] = None
@@ -60,11 +71,68 @@ class GASEAtlasBlock(nn.Module):
         h_chart = self.get_router_feature(x)
         routing_info = None
 
-        if self.adapter_mode == TASK_TRAIN and self.task_adapter is not None:
-            delta = self.apply_task_adapter(h_chart)
-            x = self.add_delta_to_cls(x, delta)
+        mode = self.adapter_mode
 
-        elif self.adapter_mode in (L9_CHART_STUDENT, SEQUENTIAL_CHART_STUDENT):
+        # --- TASK0_BOOTSTRAP: L0-L11 all use task_adapter ---
+        if mode == TASK0_BOOTSTRAP:
+            if self.task_adapter is not None:
+                delta = self.apply_task_adapter(h_chart)
+                x = self.add_delta_to_cls(x, delta)
+
+        # --- BASE_PLUS_TASK_TRAIN: L0-L8 base, L9-L11 task_adapter ---
+        elif mode == BASE_PLUS_TASK_TRAIN:
+            if self.is_base_layer and self.base_adapter is not None:
+                delta = self.apply_base_adapter(h_chart)
+                x = self.add_delta_to_cls(x, delta)
+            elif self.is_atlas_layer and self.task_adapter is not None:
+                delta = self.apply_task_adapter(h_chart)
+                x = self.add_delta_to_cls(x, delta)
+
+        # --- TASK_TRAIN (legacy): task_adapter on atlas layers ---
+        elif mode == TASK_TRAIN:
+            if self.task_adapter is not None:
+                delta = self.apply_task_adapter(h_chart)
+                x = self.add_delta_to_cls(x, delta)
+
+        # --- CURRENT_SLOT_STUDENT: base + committed slot or task ---
+        elif mode == CURRENT_SLOT_STUDENT:
+            if self.is_base_layer and self.base_adapter is not None:
+                delta = self.apply_base_adapter(h_chart)
+                x = self.add_delta_to_cls(x, delta)
+            elif self.is_atlas_layer:
+                sid = self.active_slot_id
+                if sid is not None and self._has_slot_adapter(sid):
+                    delta = self._apply_chart_free_combined(h_chart, sid)
+                    x = self.add_delta_to_cls(x, delta)
+                elif self.task_adapter is not None:
+                    delta = self.apply_task_adapter(h_chart)
+                    x = self.add_delta_to_cls(x, delta)
+
+        # --- ORACLE_SLOT_STUDENT: base + oracle slot ---
+        elif mode == ORACLE_SLOT_STUDENT:
+            if self.is_base_layer and self.base_adapter is not None:
+                delta = self.apply_base_adapter(h_chart)
+                x = self.add_delta_to_cls(x, delta)
+            elif self.is_atlas_layer:
+                sid = self.oracle_slot_id
+                if sid is not None:
+                    delta = self._apply_chart_free_combined(h_chart, sid)
+                    x = self.add_delta_to_cls(x, delta)
+
+        # --- KEY_SLOT_STUDENT: base + key-selected slot ---
+        elif mode == KEY_SLOT_STUDENT:
+            if self.is_base_layer and self.base_adapter is not None:
+                delta = self.apply_base_adapter(h_chart)
+                x = self.add_delta_to_cls(x, delta)
+            elif self.is_atlas_layer:
+                slot_ids = self.select_slot_by_key(h_chart, chart_id=0)
+                if slot_ids is not None:
+                    majority = int(torch.mode(slot_ids).values.item())
+                    delta = self._apply_chart_free_combined(h_chart, majority)
+                    x = self.add_delta_to_cls(x, delta)
+
+        # --- SEQUENTIAL_CHART_STUDENT / L9_CHART_STUDENT (legacy) ---
+        elif mode in (L9_CHART_STUDENT, SEQUENTIAL_CHART_STUDENT):
             if self.has_active_chart_adapter():
                 delta = self.apply_first_chart_adapter(h_chart)
                 x = self.add_delta_to_cls(x, delta)
@@ -72,31 +140,16 @@ class GASEAtlasBlock(nn.Module):
                 delta = self.apply_task_adapter(h_chart)
                 x = self.add_delta_to_cls(x, delta)
 
-        elif self.adapter_mode == CURRENT_SLOT_STUDENT:
-            if self.active_slot_id is not None:
-                delta = self.apply_chart_adapter_by_slot(h_chart, chart_id=0, slot_id=self.active_slot_id)
-                x = self.add_delta_to_cls(x, delta)
-            elif self.has_active_chart_adapter():
-                delta = self.apply_first_chart_adapter(h_chart)
-                x = self.add_delta_to_cls(x, delta)
-            elif self.task_adapter is not None:
-                delta = self.apply_task_adapter(h_chart)
-                x = self.add_delta_to_cls(x, delta)
-
-        elif self.adapter_mode == ORACLE_SLOT_STUDENT:
-            if self.oracle_slot_id is not None:
-                delta = self.apply_chart_adapter_by_slot(h_chart, chart_id=0, slot_id=self.oracle_slot_id)
-                x = self.add_delta_to_cls(x, delta)
-            # else identity
-
-        elif self.adapter_mode == KEY_SLOT_STUDENT:
-            slot_ids = self.select_slot_by_key(h_chart, chart_id=0)
-            if slot_ids is not None:
-                majority = int(torch.mode(slot_ids).values.item())
-                delta = self.apply_chart_adapter_by_slot(h_chart, chart_id=0, slot_id=majority)
-                x = self.add_delta_to_cls(x, delta)
-
         return x, routing_info
+
+    def _has_slot_adapter(self, slot_id: int) -> bool:
+        return f"0_{slot_id}" in self.chart_adapters
+
+    def _apply_chart_free_combined(self, h_chart: Tensor, slot_id: int) -> Tensor:
+        """Combine chart-adapter + free-adapter for a slot."""
+        delta_chart = self.apply_chart_adapter_by_slot(h_chart, chart_id=0, slot_id=slot_id)
+        delta_free = self.apply_free_adapter_by_slot(h_chart, slot_id)
+        return delta_chart + delta_free
 
     # ==================================================================
     #  Core helpers
@@ -122,6 +175,29 @@ class GASEAtlasBlock(nn.Module):
         raise ValueError(f"Expected [B,N,D] or [B,D], got {x.shape}")
 
     # ==================================================================
+    #  Base adapter
+    # ==================================================================
+
+    def set_base_adapter(self, adapter: nn.Module, freeze: bool = True) -> None:
+        self.base_adapter = adapter
+        if freeze:
+            for p in self.base_adapter.parameters():
+                p.requires_grad = False
+
+    def has_base_adapter(self) -> bool:
+        return self.base_adapter is not None
+
+    def apply_base_adapter(self, h_chart: Tensor) -> Tensor:
+        if self.base_adapter is None:
+            return torch.zeros_like(h_chart)
+        return self.base_adapter(h_chart)
+
+    def freeze_base_adapter(self) -> None:
+        if self.base_adapter is not None:
+            for p in self.base_adapter.parameters():
+                p.requires_grad = False
+
+    # ==================================================================
     #  Adapter application
     # ==================================================================
 
@@ -141,12 +217,11 @@ class GASEAtlasBlock(nn.Module):
             return torch.zeros_like(h_chart)
         first_key = next(iter(self.chart_adapters))
         adapter = self.chart_adapters[first_key]
-        chart_state = self.chart_states.get(0)
-        mu = chart_state.mu.to(h_chart.device)
+        cs = self.chart_states.get(0)
+        mu = cs.mu.to(h_chart.device)
         return adapter(h_chart, mu)
 
     def apply_chart_adapter_by_slot(self, h_chart: Tensor, chart_id: int, slot_id: int) -> Tensor:
-        """Apply a specific (chart, slot) adapter."""
         key = f"{chart_id}_{slot_id}"
         if key not in self.chart_adapters:
             return torch.zeros_like(h_chart)
@@ -157,50 +232,43 @@ class GASEAtlasBlock(nn.Module):
         mu = cs.mu.to(h_chart.device)
         return adapter(h_chart, mu)
 
-    def apply_free_adapter(self, h_chart: Tensor) -> Tensor:
-        if self.free_adapter is None:
-            return torch.zeros_like(h_chart)
-        return self.free_adapter(h_chart)
+    def apply_free_adapter_by_slot(self, h_chart: Tensor, slot_id: int) -> Tensor:
+        key = f"free_{slot_id}"
+        if key in self.free_adapters:
+            return self.free_adapters[key](h_chart)
+        return torch.zeros_like(h_chart)
 
     # ==================================================================
     #  Slot selection
     # ==================================================================
 
     def select_slot_by_key(self, h_chart: Tensor, chart_id: int = 0) -> Optional[Tensor]:
-        """Select nearest slot by L2 distance in P-space. Returns [B] slot_ids."""
         available_slots = self.get_available_slot_ids(chart_id)
         if not available_slots:
             return None
-        # Collect keys for available slots
-        keys = []
-        slot_ids_for_keys = []
+        keys, slot_ids_for_keys = [], []
         for sid in available_slots:
             sstate = self.slot_states.get(f"{chart_id}_{sid}")
             if sstate is not None and getattr(sstate, "key", None) is not None:
-                k = sstate.key.to(h_chart.device)  # [input_rank]
-                keys.append(k)
+                keys.append(sstate.key.to(h_chart.device))
                 slot_ids_for_keys.append(sid)
         if not keys:
             return None
-        key_stack = torch.stack(keys)  # [num_slots, input_rank]
-        # Get P from first available slot state for projection
+        key_stack = torch.stack(keys)
         first_sstate = self.slot_states.get(f"{chart_id}_{available_slots[0]}")
         if first_sstate is None or getattr(first_sstate, "P", None) is None:
             return None
-        P = first_sstate.P.to(h_chart.device)  # [D, input_rank]
-        # Center by chart mu
+        P = first_sstate.P.to(h_chart.device)
         cs = self.chart_states.get(chart_id)
         if cs is not None and getattr(cs, "mu", None) is not None:
-            h_proj = (h_chart - cs.mu.to(h_chart.device).unsqueeze(0)) @ P  # [B, input_rank]
+            h_proj = (h_chart - cs.mu.to(h_chart.device).unsqueeze(0)) @ P
         else:
             h_proj = h_chart @ P
-        # L2 distance to each key
-        dists = torch.cdist(h_proj, key_stack)  # [B, num_slots]
-        nearest = dists.argmin(dim=1)  # [B]
+        dists = torch.cdist(h_proj, key_stack)
+        nearest = dists.argmin(dim=1)
         return torch.tensor([slot_ids_for_keys[i.item()] for i in nearest], device=h_chart.device)
 
     def get_available_slot_ids(self, chart_id: int = 0) -> List[int]:
-        """Return sorted slot ids registered under chart_id."""
         prefix = f"{chart_id}_"
         ids = []
         for key in self.chart_adapters:
@@ -240,14 +308,20 @@ class GASEAtlasBlock(nn.Module):
     def register_chart_adapter(
         self, chart_id: int, slot_id: int, adapter: nn.Module, freeze: bool = True,
     ) -> None:
-        """Register a chart-slot adapter. Old slots are preserved (not overwritten)."""
         key = f"{chart_id}_{slot_id}"
         if key in self.chart_adapters:
             raise ValueError(
                 f"Adapter already registered for chart={chart_id} slot={slot_id} "
-                f"at layer {self.layer_id}. Old slots must not be overwritten."
+                f"at layer {self.layer_id}."
             )
         self.chart_adapters[key] = adapter
+        if freeze:
+            for p in adapter.parameters():
+                p.requires_grad = False
+
+    def register_free_adapter(self, slot_id: int, adapter: nn.Module, freeze: bool = True) -> None:
+        key = f"free_{slot_id}"
+        self.free_adapters[key] = adapter
         if freeze:
             for p in adapter.parameters():
                 p.requires_grad = False
@@ -259,8 +333,8 @@ class GASEAtlasBlock(nn.Module):
         for adapter in self.chart_adapters.values():
             for p in adapter.parameters():
                 p.requires_grad = False
-        if self.free_adapter is not None:
-            for p in self.free_adapter.parameters():
+        for adapter in self.free_adapters.values():
+            for p in adapter.parameters():
                 p.requires_grad = False
 
     def unfreeze_task_adapter(self) -> None:
@@ -279,7 +353,7 @@ class GASEAtlasBlock(nn.Module):
         return block_output, h_chart, delta_teacher
 
     def apply_chart_adapters(self, h_chart, chart_probs=None, slot_probs=None):
-        raise NotImplementedError("Phase-6 uses slot-based adapter application.")
+        raise NotImplementedError("Use slot-based methods.")
 
     def combine_residuals(self, delta_task, delta_chart, delta_free, routing_info=None):
-        raise NotImplementedError("Phase-6 uses per-mode residual logic in forward().")
+        raise NotImplementedError("Use per-mode residual logic in forward().")

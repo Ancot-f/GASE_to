@@ -78,6 +78,11 @@ def _train(args):
         cnn_accy, nme_accy = model.eval_task()
         model.after_task()
 
+        # GASE: respect should_stop_training flag
+        if hasattr(model, "should_stop_training") and model.should_stop_training:
+            logging.info("[Trainer] Learner requested stop. Breaking task loop.")
+            break
+
         if nme_accy is not None:
             logging.info("CNN: {}".format(cnn_accy["grouped"]))
             logging.info("NME: {}".format(nme_accy["grouped"]))

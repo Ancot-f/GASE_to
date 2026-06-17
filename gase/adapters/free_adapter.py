@@ -41,10 +41,16 @@ class FreeAdapter(nn.Module):
         self.scale = scale
 
         self.gate = nn.Parameter(torch.tensor(0.0))
-        self.down_proj = nn.Linear(dim, bottleneck_dim, bias=False)
+        self.down_proj = nn.Linear(dim, bottleneck_dim, bias=True)
         self.act = nn.ReLU()
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
-        self.up_proj = nn.Linear(bottleneck_dim, dim, bias=False)
+        self.up_proj = nn.Linear(bottleneck_dim, dim, bias=True)
+
+        # SEMA-identical init (init_option="lora")
+        nn.init.kaiming_uniform_(self.down_proj.weight, a=5 ** 0.5)
+        nn.init.zeros_(self.down_proj.bias)
+        nn.init.zeros_(self.up_proj.weight)
+        nn.init.zeros_(self.up_proj.bias)
 
     def forward(self, h_chart: Tensor) -> Tensor:
         """
