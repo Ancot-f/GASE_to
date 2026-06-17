@@ -211,8 +211,95 @@ class FeatureCollector:
         return batch
 
     # ------------------------------------------------------------------
-    #  General collection entry (Phase-3: delegates to L9)
+    #  General collection (Phase-5: supports L9/L10/L11)
     # ------------------------------------------------------------------
+
+    def collect_layer_features(
+        self,
+        data_loader: DataLoader,
+        layer_id: int,
+        task_id: int,
+    ) -> LayerFeatureBatch:
+        """
+        Collect h_chart and delta_teacher for any GASE atlas layer.
+
+        Uses the model's extract_layer_chart_feature_and_teacher which
+        runs sequential_chart_student mode on prefix layers, ensuring
+        that lower-layer committed chart-adapters produce the correct
+        permanent/student path features.
+
+        Supports L9/L10/L11 in Phase-5.
+
+        Args:
+            data_loader: DataLoader.
+            layer_id: ViT block index (9, 10, or 11).
+            task_id: current task id.
+
+        Returns:
+            LayerFeatureBatch with concatenated data.
+        """
+        self.model.eval()
+
+        all_h_chart: List[Tensor] = []
+        all_delta_teacher: List[Tensor] = []
+        all_teacher_logits: List[Tensor] = []
+        all_labels: List[Tensor] = []
+        all_sample_indices: List[Tensor] = []
+
+        with torch.no_grad():
+            for batch in data_loader:
+                if len(batch) == 3:
+                    sample_idx, inputs, targets = batch
+                    if isinstance(sample_idx, Tensor):
+                        all_sample_indices.append(sample_idx)
+                elif len(batch) == 2:
+                    inputs, targets = batch
+                else:
+                    raise ValueError(f"Unexpected batch length: {len(batch)}")
+
+                inputs = inputs.to(self.device)
+                targets = targets.to(self.device)
+
+                backbone = self.model
+                if hasattr(self.model, "module"):
+                    backbone = self.model.module
+                if hasattr(backbone, "backbone"):
+                    backbone = backbone.backbone
+
+                h_chart, delta_teacher = backbone.extract_layer_chart_feature_and_teacher(
+                    inputs, layer_id=layer_id
+                )
+                teacher_logits = backbone.compute_teacher_logits(inputs)
+
+                all_h_chart.append(h_chart.detach().cpu())
+                all_delta_teacher.append(delta_teacher.detach().cpu())
+                all_teacher_logits.append(teacher_logits.detach().cpu())
+                all_labels.append(targets.cpu())
+
+        h_chart_cat = torch.cat(all_h_chart, dim=0)
+        delta_teacher_cat = torch.cat(all_delta_teacher, dim=0)
+        teacher_logits_cat = torch.cat(all_teacher_logits, dim=0)
+        labels_cat = torch.cat(all_labels, dim=0)
+        sample_indices_cat = (
+            torch.cat(all_sample_indices, dim=0) if all_sample_indices else None
+        )
+
+        batch = LayerFeatureBatch(
+            layer_id=layer_id,
+            h_chart=h_chart_cat,
+            delta_teacher=delta_teacher_cat,
+            teacher_logits=teacher_logits_cat,
+            labels=labels_cat,
+            sample_indices=sample_indices_cat,
+        )
+
+        logging.info(
+            "[FeatureCollector] task=%d layer=%d samples=%d",
+            task_id, layer_id, h_chart_cat.shape[0],
+        )
+        logging.info("[FeatureCollector] %s", batch.summary())
+
+        return batch
 
     def collect_for_task(
         self,
@@ -222,8 +309,7 @@ class FeatureCollector:
         """
         Collect features for all atlas layers for a given task.
 
-        Phase-3: only L9 is collected authoritatively.
-        L10/L11 raise NotImplementedError.
+        Phase-5: supports L9/L10/L11 via collect_layer_features.
 
         Args:
             data_loader: DataLoader.
@@ -234,40 +320,18 @@ class FeatureCollector:
         """
         result: Dict[int, LayerFeatureBatch] = {}
         for lid in self.atlas_layers:
-            if lid == 9:
-                result[lid] = self.collect_l9_features(data_loader, task_id)
-            else:
-                raise NotImplementedError(
-                    f"Phase-3 only supports L9 collection. "
-                    f"Layer {lid} requires sequential chart-adapter commit."
-                )
+            result[lid] = self.collect_layer_features(data_loader, lid, task_id)
         return result
 
-    def collect_layer_features(
-        self,
-        data_loader: DataLoader,
-        layer_id: int,
-        task_id: int,
+    # ------------------------------------------------------------------
+    #  L9 collection (Phase-3, kept for backward compat)
+    # ------------------------------------------------------------------
+
+    def collect_l9_features(
+        self, data_loader: DataLoader, task_id: int
     ) -> LayerFeatureBatch:
-        """
-        Collect features at a single layer.
-
-        Phase-3: delegates to collect_l9_features for layer_id=9.
-
-        Args:
-            data_loader: DataLoader.
-            layer_id: ViT block index.
-            task_id: current task id.
-
-        Returns:
-            LayerFeatureBatch.
-        """
-        if layer_id == 9:
-            return self.collect_l9_features(data_loader, task_id)
-        else:
-            raise NotImplementedError(
-                f"Phase-3 only supports L9 collection (got layer_id={layer_id})."
-            )
+        """Collect authoritative L9 features (delegates to collect_layer_features)."""
+        return self.collect_layer_features(data_loader, layer_id=9, task_id=task_id)
 
     # ------------------------------------------------------------------
     #  Future: sequential collection (Phase-4+)

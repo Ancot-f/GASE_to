@@ -161,8 +161,8 @@ class ChartBuilder:
         chart_state = ppca.to_chart_state(layer_id=layer_id, chart_id=chart_id)
 
         logging.info(
-            "[L9Chart] layer=%d chart_id=%d support=%d rank=%d sigma_perp=%.4f",
-            layer_id, chart_id, chart_state.n_support, ppca.rank, ppca.sigma_perp,
+            "[L%dChart] layer=%d chart_id=%d support=%d rank=%d sigma_perp=%.4f",
+            layer_id, layer_id, chart_id, chart_state.n_support, ppca.rank, ppca.sigma_perp,
         )
         return chart_state
 

@@ -16,7 +16,7 @@ import torch
 from torch import Tensor
 from torch import nn
 
-from .gase_components import TASK_TRAIN, DISTILL, INFER, L9_CHART_STUDENT, RoutingOutput
+from .gase_components import TASK_TRAIN, DISTILL, INFER, L9_CHART_STUDENT, SEQUENTIAL_CHART_STUDENT, RoutingOutput
 
 
 class GASEAtlasBlock(nn.Module):
@@ -83,7 +83,9 @@ class GASEAtlasBlock(nn.Module):
         3. Apply adapter residual based on mode:
            - task_train: task_adapter residual to CLS token.
            - l9_chart_student: L9 uses chart-adapter, L10/L11 use task_adapter.
-           - distill/infer: Phase-2 identity pass-through.
+           - sequential_chart_student: any committed layer uses chart-adapter,
+             uncommitted layers use task_adapter.
+           - distill/infer: identity pass-through.
 
         Args:
             x: input features of shape [B, N, D].
@@ -99,21 +101,12 @@ class GASEAtlasBlock(nn.Module):
             delta_task = self.apply_task_adapter(h_chart)
             x = self.add_delta_to_cls(x, delta_task)
 
-        elif self.adapter_mode == L9_CHART_STUDENT:
+        elif self.adapter_mode in (L9_CHART_STUDENT, SEQUENTIAL_CHART_STUDENT):
             h_chart = self.get_router_feature(x)
-            if self.layer_id == 9 and len(self.chart_adapters) > 0 and len(self.chart_states) > 0:
-                # L9: use first chart-adapter with its chart mu
-                # Take the first (chart_id, slot_id) pair
-                first_adapter_key = next(iter(self.chart_adapters))
-                adapter = self.chart_adapters[first_adapter_key]
-                # Get corresponding chart state (chart_id=0)
-                chart_state = self.chart_states.get(0)
-                if chart_state is not None and chart_state.mu is not None:
-                    mu = chart_state.mu.to(x.device)
-                    delta_chart = adapter(h_chart, mu)
-                    x = self.add_delta_to_cls(x, delta_chart)
-            elif self.layer_id in (10, 11) and self.task_adapter is not None:
-                # L10/L11: still use task_adapter teacher for isolation
+            if self.has_active_chart_adapter():
+                delta_chart = self.apply_first_chart_adapter(h_chart)
+                x = self.add_delta_to_cls(x, delta_chart)
+            elif self.task_adapter is not None:
                 delta_task = self.apply_task_adapter(h_chart)
                 x = self.add_delta_to_cls(x, delta_task)
 
@@ -294,11 +287,42 @@ class GASEAtlasBlock(nn.Module):
         Set the adapter mode.
 
         Args:
-            mode: one of TASK_TRAIN, DISTILL, INFER, L9_CHART_STUDENT.
+            mode: one of TASK_TRAIN, DISTILL, INFER,
+                  L9_CHART_STUDENT, SEQUENTIAL_CHART_STUDENT.
         """
-        if mode not in (TASK_TRAIN, DISTILL, INFER, L9_CHART_STUDENT):
+        if mode not in (TASK_TRAIN, DISTILL, INFER, L9_CHART_STUDENT, SEQUENTIAL_CHART_STUDENT):
             raise ValueError(f"Unknown adapter_mode: {mode}")
         self.adapter_mode = mode
+
+    def has_active_chart_adapter(self) -> bool:
+        """
+        Return True if at least one chart-adapter with chart state is registered.
+
+        Phase-5 assumes one chart and one slot per layer.
+        """
+        if len(self.chart_adapters) == 0 or len(self.chart_states) == 0:
+            return False
+        # Check that chart_id=0 has valid mu
+        cs = self.chart_states.get(0)
+        return cs is not None and getattr(cs, "mu", None) is not None
+
+    def apply_first_chart_adapter(self, h_chart: Tensor) -> Tensor:
+        """
+        Phase-5: use the first registered chart-adapter with chart mu.
+
+        Args:
+            h_chart: pre-adapter CLS features [B, D].
+
+        Returns:
+            delta_chart of shape [B, D], or zeros if no active adapter.
+        """
+        if not self.has_active_chart_adapter():
+            return torch.zeros_like(h_chart)
+        first_key = next(iter(self.chart_adapters))
+        adapter = self.chart_adapters[first_key]
+        chart_state = self.chart_states.get(0)
+        mu = chart_state.mu.to(h_chart.device)
+        return adapter(h_chart, mu)
 
     def register_chart(self, chart_state: object) -> None:
         """Register a ChartState for this block's atlas."""

@@ -100,7 +100,8 @@ class ChartAdapterDistiller:
         metrics = _compute_residual_metrics(delta_pred, delta_teacher)
 
         logging.info(
-            "[L9Distill] residual_mse=%.6f residual_cos=%.4f fit_r2=%.4f norm_ratio=%.4f",
+            "[L%dDistill] residual_mse=%.6f residual_cos=%.4f fit_r2=%.4f norm_ratio=%.4f",
+            chart_state.layer_id,
             metrics["residual_mse"],
             metrics["residual_cos"],
             metrics["fit_r2"],

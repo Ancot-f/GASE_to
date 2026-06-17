@@ -61,6 +61,9 @@ class GASELearner(BaseLearner):
         # Phase flag
         self.phase: str = args.get("phase", "task_adapter_only")
         self.phase4_report: Optional[Dict] = None
+        self.phase5_report: Optional[Dict] = None
+        self.debug_max_tasks: int = args.get("debug_max_tasks", -1)
+        self.stop_after_task: int = args.get("stop_after_task", -1)
 
         logging.info(
             "GASELearner Phase-2 initialized. atlas_layers=%s, adapter_dim=%d",
@@ -314,6 +317,23 @@ class GASELearner(BaseLearner):
             self.distill_l9_one_chart_one_slot(task_id=self._cur_task)
             self.evaluate_l9_student_vs_teacher(self.test_loader)
 
+        # Phase-5: sequential L9→L10→L11 one-chart one-slot
+        if self.phase == "sequential_one_chart_one_slot":
+            max_tasks = self.debug_max_tasks
+            stop_after = self.stop_after_task
+            if (max_tasks > 0 and self._cur_task >= max_tasks) or \
+               (stop_after >= 0 and self._cur_task > stop_after):
+                logging.info("[GASE] Phase-5: skipping task %d (debug limit)", self._cur_task)
+                return
+
+            logging.info("[GASE] Phase-5: sequential L9→L10→L11 distillation...")
+            self.distill_sequential_one_chart_one_slot(
+                task_id=self._cur_task, train_loader=self.train_loader
+            )
+            eval_metrics = self.evaluate_sequential_student_vs_teacher(self.test_loader)
+            if self.phase5_report is not None:
+                self.phase5_report["eval"] = eval_metrics
+
     # ==================================================================
     #  Reports (minimal debug versions)
     # ==================================================================
@@ -349,21 +369,22 @@ class GASELearner(BaseLearner):
     # ==================================================================
 
     # ==================================================================
-    #  Phase-4: L9 one-chart one-slot distillation
+    #  Phase-5: Generalized one-chart one-slot distillation per layer
     # ==================================================================
 
-    def distill_l9_one_chart_one_slot(self, task_id: int) -> Dict:
+    def distill_one_chart_one_slot_for_layer(
+        self, task_id: int, layer_id: int
+    ) -> Dict:
         """
-        Phase-4 pipeline:
-          1. Read L9 LayerFeatureBatch from self.distill_cache.
-          2. Build one ChartState (PPCA).
-          3. Build one SlotState (cross-covariance SVD).
-          4. Fit one LinearChartAdapter (ridge regression).
-          5. Register adapter + chart into L9 GASEAtlasBlock.
-          6. Print and return metrics.
+        Build one chart, one slot, and one LinearChartAdapter for a target layer.
+
+        Reads cached features from self.distill_cache, fits PPCA chart,
+        cross-covariance slot, ridge-regression LinearChartAdapter,
+        and registers everything into the corresponding GASEAtlasBlock.
 
         Args:
             task_id: current task id.
+            layer_id: target atlas layer (9, 10, or 11).
 
         Returns:
             Dict with chart, slot, distill metrics.
@@ -372,80 +393,124 @@ class GASELearner(BaseLearner):
         from gase.slots.slot_builder import SlotBuilder
         from gase.distill.chart_distiller import ChartAdapterDistiller
 
-        # 1. Get cached L9 features
-        batch = self.distill_cache.get_layer_cache(9)
+        batch = self.distill_cache.get_layer_cache(layer_id)
         h_chart = batch.h_chart.to(self._device)
         delta_teacher = batch.delta_teacher.to(self._device)
 
         logging.info(
-            "[L9Distill] Starting one-chart one-slot distillation, task=%d samples=%d",
-            task_id, h_chart.shape[0],
+            "[SequentialDistill] Start layer=%d, task=%d samples=%d",
+            layer_id, task_id, h_chart.shape[0],
         )
 
-        # 2. Build one chart
+        # Build chart
         chart_builder = ChartBuilder(self.args.get("chart", {}))
         chart_state = chart_builder.build_single_chart_for_layer(
-            h_chart, layer_id=9, chart_id=0
+            h_chart, layer_id=layer_id, chart_id=0
         )
-        self.chart_atlases[9] = [chart_state]
+        self.chart_atlases[layer_id] = [chart_state]
 
-        # 3. Build one slot
+        # Build slot
         slot_builder = SlotBuilder(self.args.get("slot", {}))
         slot_state = slot_builder.create_single_slot_from_residuals(
             chart_state, h_chart, delta_teacher, task_id=task_id, slot_id=0
         )
 
-        # 4. Fit LinearChartAdapter
+        # Fit adapter
         distiller = ChartAdapterDistiller(self.args.get("distill", {}))
         adapter, metrics = distiller.fit_linear_chart_adapter(
             chart_state, slot_state, h_chart, delta_teacher
         )
 
-        # 5. Register into L9 GASEAtlasBlock
-        blk_l9 = self._network.backbone.get_block(9)
-        blk_l9.register_chart(chart_state)
-        blk_l9.register_chart_adapter(
-            chart_id=0, slot_id=0, adapter=adapter
+        # Register into GASEAtlasBlock
+        blk = self._network.backbone.get_block(layer_id)
+        blk.register_chart(chart_state)
+        blk.register_chart_adapter(chart_id=0, slot_id=0, adapter=adapter)
+
+        logging.info(
+            "[SequentialDistill] Committed layer=%d chart-adapter", layer_id,
         )
 
-        # 6. Save report
-        self.phase4_report = {
-            "chart": chart_state.to_dict(),
-            "slot": slot_state.to_dict(),
-            "distill": metrics,
-        }
+        return {"chart": chart_state.to_dict(), "slot": slot_state.to_dict(),
+                "distill": metrics}
 
-        return self.phase4_report
+    # ------------------------------------------------------------------
+    #  Phase-5: Sequential three-layer pipeline
+    # ------------------------------------------------------------------
 
-    def evaluate_l9_student_vs_teacher(self, test_loader) -> Dict:
+    def distill_sequential_one_chart_one_slot(
+        self, task_id: int, train_loader
+    ) -> Dict:
         """
-        Compare full teacher path and L9 chart-student path.
+        Phase-5 pipeline:
+          L9 collect -> distill -> register -> commit
+          L10 collect -> distill -> register -> commit
+          L11 collect -> distill -> register -> commit
 
-        Teacher: L9/L10/L11 use task_adapter (TASK_TRAIN mode).
-        Student: L9 uses chart_adapter, L10/L11 use task_adapter.
+        Each lower-layer chart-adapter is committed before collecting
+        the next layer's features, ensuring h_chart is correct on the
+        permanent/student path.
 
         Args:
-            test_loader: test DataLoader.
+            task_id: current task id.
+            train_loader: DataLoader for feature collection.
 
         Returns:
-            Dict with teacher_acc, student_acc, gap.
+            Dict with per-layer metrics.
+        """
+        from gase.distill.feature_collector import FeatureCollector
+        from gase.distill.cache import DistillCache
+
+        if self.distill_cache is None:
+            self.distill_cache = DistillCache()
+
+        collector = FeatureCollector(
+            model=self._network,
+            atlas_layers=[9],
+            device=self._device,
+            collect_mode="sequential",
+        )
+
+        all_metrics: Dict[int, Dict] = {}
+
+        for layer_id in self.atlas_layers:  # [9, 10, 11]
+            # Collect features using sequential student mode on prefix
+            batch = collector.collect_layer_features(
+                train_loader, layer_id=layer_id, task_id=task_id
+            )
+            self.distill_cache.add_layer_batch(layer_id, batch)
+
+            # Distill and register
+            metrics = self.distill_one_chart_one_slot_for_layer(task_id, layer_id)
+            all_metrics[layer_id] = metrics
+
+        self.phase5_report = all_metrics
+        return all_metrics
+
+    # ------------------------------------------------------------------
+    #  Phase-5: Full teacher vs student eval
+    # ------------------------------------------------------------------
+
+    def evaluate_sequential_student_vs_teacher(self, test_loader) -> Dict:
+        """
+        Compare full teacher path and full sequential chart-student path.
+
+        Teacher: L9/L10/L11 use task_adapter.
+        Student: committed layers use chart-adapter,
+                 uncommitted layers use task_adapter.
         """
         backbone = self._network.backbone
 
-        # Teacher eval
         backbone.set_adapter_mode("task_train")
         teacher_acc = self._compute_accuracy(self._network, test_loader)
 
-        # Student eval (L9 chart, L10/L11 task_adapter)
-        backbone.set_adapter_mode("l9_chart_student")
+        backbone.set_adapter_mode("sequential_chart_student")
         student_acc = self._compute_accuracy(self._network, test_loader)
 
-        # Restore
         backbone.set_adapter_mode("task_train")
 
         gap = teacher_acc - student_acc
         logging.info(
-            "[L9StudentEval] teacher_acc=%.2f student_acc=%.2f gap=%.2f",
+            "[SequentialStudentEval] teacher_acc=%.2f student_acc=%.2f gap=%.2f",
             teacher_acc, student_acc, gap,
         )
 
@@ -455,10 +520,22 @@ class GASELearner(BaseLearner):
             "gap": float(gap),
         }
 
-        if self.phase4_report is not None:
-            self.phase4_report["eval"] = eval_metrics
+        if self.phase5_report is not None:
+            self.phase5_report["eval"] = eval_metrics
 
         return eval_metrics
+
+    # ------------------------------------------------------------------
+    #  Phase-4 backward compat wrappers
+    # ------------------------------------------------------------------
+
+    def distill_l9_one_chart_one_slot(self, task_id: int) -> Dict:
+        """Phase-4 backward compat: delegates to distill_one_chart_one_slot_for_layer."""
+        return self.distill_one_chart_one_slot_for_layer(task_id, layer_id=9)
+
+    def evaluate_l9_student_vs_teacher(self, test_loader) -> Dict:
+        """Phase-4 backward compat: delegates to evaluate_sequential_student_vs_teacher."""
+        return self.evaluate_sequential_student_vs_teacher(test_loader)
 
     def train_task_adapter(self, task_id: int, train_loader: DataLoader) -> None:
         raise NotImplementedError("Phase-2 uses _train() directly.")

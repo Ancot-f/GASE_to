@@ -10,6 +10,7 @@ TASK_TRAIN = "task_train"
 DISTILL = "distill"
 INFER = "infer"
 L9_CHART_STUDENT = "l9_chart_student"
+SEQUENTIAL_CHART_STUDENT = "sequential_chart_student"
 
 # Chart state constants
 CHART_CANDIDATE = "candidate"

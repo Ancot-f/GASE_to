@@ -89,8 +89,8 @@ class SlotBuilder:
         chart_state.add_slot_id(slot_id)
 
         logging.info(
-            "[L9Slot] slot_id=%d input_rank=%d output_rank=%d support=%d",
-            slot_id, self.input_rank, self.output_rank, h_chart.shape[0],
+            "[L%dSlot] slot_id=%d input_rank=%d output_rank=%d support=%d",
+            chart_state.layer_id, slot_id, self.input_rank, self.output_rank, h_chart.shape[0],
         )
         return slot_state
 
