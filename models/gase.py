@@ -79,6 +79,20 @@ class GASELearner(BaseLearner):
         self._cur_task += 1
         self.current_task_id = self._cur_task
 
+        # Phase-5.5: stop_after_task / debug_max_tasks protection
+        if self.stop_after_task >= 0 and self._cur_task > self.stop_after_task:
+            logging.info(
+                "[GASE] stop_after_task=%d reached at task %d. Skipping.",
+                self.stop_after_task, self._cur_task,
+            )
+            return
+        if self.debug_max_tasks > 0 and self._cur_task >= self.debug_max_tasks:
+            logging.info(
+                "[GASE] debug_max_tasks=%d reached at task %d. Skipping.",
+                self.debug_max_tasks, self._cur_task,
+            )
+            return
+
         if self._cur_task == 0:
             self._network.backbone.head = nn.Linear(
                 self._network.backbone.embed_dim, data_manager.nb_classes
@@ -473,6 +487,16 @@ class GASELearner(BaseLearner):
         all_metrics: Dict[int, Dict] = {}
 
         for layer_id in self.atlas_layers:  # [9, 10, 11]
+            # Determine which prefix layers have committed chart-adapters
+            committed = [
+                lid for lid in self.atlas_layers if lid < layer_id
+                and self._network.backbone.get_block(lid).has_active_chart_adapter()
+            ]
+            logging.info(
+                "[SequentialDistill] Start layer=%d, prefix committed=%s",
+                layer_id, committed,
+            )
+
             # Collect features using sequential student mode on prefix
             batch = collector.collect_layer_features(
                 train_loader, layer_id=layer_id, task_id=task_id
@@ -499,6 +523,15 @@ class GASELearner(BaseLearner):
                  uncommitted layers use task_adapter.
         """
         backbone = self._network.backbone
+
+        # Log which layers have committed chart-adapters
+        committed = [
+            lid for lid in self.atlas_layers
+            if backbone.get_block(lid).has_active_chart_adapter()
+        ]
+        logging.info(
+            "[SequentialStudentEval] committed_layers=%s", committed,
+        )
 
         backbone.set_adapter_mode("task_train")
         teacher_acc = self._compute_accuracy(self._network, test_loader)
