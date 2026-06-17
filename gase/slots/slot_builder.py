@@ -61,12 +61,23 @@ class SlotBuilder:
         Returns:
             SlotState with P, R, b, key populated.
         """
+        # Anti-corruption: slot must not overwrite existing slot_id
+        assert slot_id not in chart_state.slot_ids, (
+            f"Slot {slot_id} already exists in chart {chart_state.chart_id} "
+            f"layer {chart_state.layer_id}. Old slots must not be overwritten."
+        )
+        assert delta_teacher is not None, "SlotBuilder requires delta_teacher."
+        assert h_chart.shape == delta_teacher.shape, (
+            f"Shape mismatch: h_chart {h_chart.shape} vs delta_teacher {delta_teacher.shape}"
+        )
+        assert chart_state.mu is not None, "ChartState must have mu set before slot creation."
+
         P, R = self.estimate_slot_bases(h_chart, delta_teacher)
         b = delta_teacher.mean(dim=0)  # [D]
 
-        # Center h_chart by chart mean for key computation
+        # key and key_var from P-space projection
         h_centered = h_chart - chart_state.mu.unsqueeze(0)
-        key = self.compute_slot_key(h_centered, P)
+        key, key_var = self.compute_slot_key_with_var(h_centered, P)
 
         slot_state = SlotState(
             slot_id=slot_id,
@@ -79,6 +90,7 @@ class SlotBuilder:
             B=None,
             b=b.clone().detach(),
             key=key.clone().detach(),
+            key_var=key_var.clone().detach(),
             support=h_chart.shape[0],
             quality={},
             state="active",
@@ -89,8 +101,12 @@ class SlotBuilder:
         chart_state.add_slot_id(slot_id)
 
         logging.info(
-            "[L%dSlot] slot_id=%d input_rank=%d output_rank=%d support=%d",
-            chart_state.layer_id, slot_id, self.input_rank, self.output_rank, h_chart.shape[0],
+            "[SlotContract] layer=%d chart=%d slot=%d "
+            "definition=residual_field_mode method=cross_covariance_svd "
+            "P_shape=%s R_shape=%s key_norm=%.4f b_norm=%.4f support=%d",
+            chart_state.layer_id, chart_state.chart_id, slot_id,
+            list(P.shape), list(R.shape),
+            float(key.norm()), float(b.norm()), h_chart.shape[0],
         )
         return slot_state
 
@@ -132,18 +148,39 @@ class SlotBuilder:
         return P, R
 
     def compute_slot_key(self, h_chart: Tensor, P: Tensor) -> Tensor:
-        """
-        Compute slot key as mean P-space coordinate.
+        """Legacy: returns key only."""
+        z = h_chart @ P
+        return z.mean(dim=0)
 
-        Args:
-            h_chart: features of shape [N, D] (should be centered by chart mu).
-            P: input projection basis of shape [D, input_rank].
-
-        Returns:
-            Key vector of shape [input_rank].
+    def compute_slot_key_with_var(
+        self, h_chart: Tensor, P: Tensor,
+    ) -> Tuple[Tensor, Tensor]:
         """
-        z = h_chart @ P  # [N, input_rank]
-        return z.mean(dim=0)  # [input_rank]
+        Compute slot key and key variance in P-space.
+
+        key = mean(P^T @ (h - mu)), key_var = var(P^T @ (h - mu)) + eps.
+        """
+        z = h_chart @ P
+        key = z.mean(dim=0)
+        key_var = z.var(dim=0, unbiased=False) + 1e-6
+        return key, key_var
+
+    # ------------------------------------------------------------------
+    #  Future: slot compatibility evaluation (skeleton only)
+    # ------------------------------------------------------------------
+
+    def evaluate_slot_compatibility(
+        self,
+        chart_state: ChartState,
+        existing_slots: List[SlotState],
+        h_chart: Tensor,
+        delta_teacher: Tensor,
+    ):
+        """
+        Future only. Check whether current residual field can reuse an existing slot.
+        Do not use in Phase-6.5.
+        """
+        raise NotImplementedError("Phase-7+ will implement slot reuse evaluation.")
 
     # ------------------------------------------------------------------
     #  Unimplemented (Phase-5+)

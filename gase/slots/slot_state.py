@@ -48,6 +48,7 @@ class SlotState:
     B: Optional[Tensor] = None
     b: Optional[Tensor] = None
     key: Optional[Tensor] = None
+    key_var: Optional[Tensor] = None
     support: int = 0
     quality: Dict[str, float] = field(default_factory=dict)
     state: str = "candidate"

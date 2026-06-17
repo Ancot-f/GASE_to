@@ -22,6 +22,8 @@ class FreeAdapterDistiller:
         h_chart: Tensor,
         delta_teacher: Tensor,
         delta_chart: Tensor,
+        layer_id: int = 0,
+        slot_id: int = 0,
     ) -> Tuple[FreeAdapter, Dict[str, float]]:
         """
         Train a FreeAdapter to fit: target = delta_teacher - delta_chart.
@@ -71,6 +73,11 @@ class FreeAdapterDistiller:
             "free_pred_norm": free_pred_norm, "combined_mse": combined_mse,
             "combined_cos": combined_cos, "combined_r2": combined_r2,
         }
-        logging.info("[L%dFree] combined_cos=%.4f combined_r2=%.4f free_mse=%.6f",
-                     0, combined_cos, combined_r2, free_mse)
+        logging.info(
+            "[FreeContract] layer=%d slot=%d "
+            "definition=leftover_residual_compensator "
+            "target=delta_teacher-delta_chart "
+            "leftover_norm=%.4f combined_cos=%.4f combined_r2=%.4f",
+            layer_id, slot_id, leftover_norm, combined_cos, combined_r2,
+        )
         return adapter, metrics

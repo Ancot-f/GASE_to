@@ -104,11 +104,10 @@ class GASELearner(BaseLearner):
             return
 
         if self._cur_task == 0:
-            self._network.backbone.head = nn.Linear(
+            from backbone.linears import CosineLinear
+            self._network.backbone.head = CosineLinear(
                 self._network.backbone.embed_dim, data_manager.nb_classes
             )
-            nn.init.kaiming_uniform_(self._network.backbone.head.weight, a=math.sqrt(5))
-            nn.init.zeros_(self._network.backbone.head.bias)
 
         self._total_classes = self._known_classes + data_manager.get_task_size(self._cur_task)
         logging.info("Learning on {}-{}".format(self._known_classes, self._total_classes))
@@ -507,6 +506,7 @@ class GASELearner(BaseLearner):
             free_distiller = FreeAdapterDistiller(self.args)
             free_adapter_obj, free_metrics = free_distiller.fit_free_adapter_for_layer_slot(
                 h_chart, delta_teacher, delta_chart,
+                layer_id=layer_id, slot_id=slot_id,
             )
             blk.register_free_adapter(slot_id, free_adapter_obj, freeze=True)
             metrics.update(free_metrics)

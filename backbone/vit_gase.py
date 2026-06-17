@@ -102,7 +102,11 @@ class ViTGASE(nn.Module):
 
     def forward(self, x: Tensor) -> Dict[str, Tensor]:
         features = self.forward_features(x)
-        logits = self.head(features)
+        head_out = self.head(features)
+        if isinstance(head_out, dict):
+            logits = head_out["logits"]
+        else:
+            logits = head_out
         return {"features": features, "logits": logits}
 
     def forward_features(self, x: Tensor) -> Tensor:

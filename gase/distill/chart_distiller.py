@@ -100,12 +100,12 @@ class ChartAdapterDistiller:
         metrics = _compute_residual_metrics(delta_pred, delta_teacher)
 
         logging.info(
-            "[L%dDistill] residual_mse=%.6f residual_cos=%.4f fit_r2=%.4f norm_ratio=%.4f",
-            chart_state.layer_id,
-            metrics["residual_mse"],
-            metrics["residual_cos"],
-            metrics["fit_r2"],
-            metrics["norm_ratio"],
+            "[AdapterContract] layer=%d chart=%d slot=%d "
+            "definition=local_residual_operator method=ridge_regression "
+            "formula=b+RBP^T(h-mu) "
+            "residual_cos=%.4f fit_r2=%.4f norm_ratio=%.4f",
+            chart_state.layer_id, chart_state.chart_id, slot_state.slot_id,
+            metrics["residual_cos"], metrics["fit_r2"], metrics["norm_ratio"],
         )
 
         return adapter, metrics

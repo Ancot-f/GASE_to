@@ -29,6 +29,7 @@ class PPCAEstimator(nn.Module):
         self.U: Tensor = torch.zeros(dim, rank)
         self.eigvals: Tensor = torch.zeros(rank)
         self.sigma_perp: float = 1.0
+        self.radius_d2: float = 0.0
         self.n_support: int = 0
 
     def fit(self, h_chart: Tensor, rank: int) -> "PPCAEstimator":
@@ -57,7 +58,21 @@ class PPCAEstimator(nn.Module):
         residuals = h_chart - h_rec
         self.sigma_perp = float(residuals.pow(2).mean().sqrt())
 
+        # Compute radius_d2: PPCA Mahalanobis distance at 95th percentile
+        with torch.no_grad():
+            d2 = self._ppca_mahalanobis_d2(h_chart)
+            self.radius_d2 = float(torch.quantile(d2, 0.95))
+
         return self
+
+    def _ppca_mahalanobis_d2(self, h_chart: Tensor) -> Tensor:
+        """Compute PPCA Mahalanobis d^2 per sample."""
+        h_centered = h_chart - self.mu.unsqueeze(0)
+        z = h_centered @ self.U  # [N, rank]
+        tangent_term = (z ** 2 / (self.eigvals.unsqueeze(0) + 1e-8)).sum(dim=1)
+        normal_residual = h_centered - z @ self.U.mT
+        normal_term = (normal_residual ** 2).sum(dim=1) / max(self.sigma_perp ** 2, 1e-8)
+        return tangent_term + normal_term
 
     def transform(self, h_chart: Tensor) -> Tensor:
         """
@@ -107,7 +122,7 @@ class PPCAEstimator(nn.Module):
             sigma_perp=self.sigma_perp,
             prior=1.0,
             trust_nll=0.0,
-            radius_d2=0.0,
+            radius_d2=self.radius_d2,
             n_support=self.n_support,
             age=0,
             hit_count=0,

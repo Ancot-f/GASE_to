@@ -1,8 +1,15 @@
-"""ChartBuilder: discovers and initializes new charts from uncovered features."""
+"""
+ChartBuilder: PPCA-based chart construction from feature geometry.
+
+Chart = feature geometry container.
+Chart uses ONLY h_chart (pre-adapter CLS feature).
+Chart MUST NOT use delta_teacher, labels, or task_id.
+"""
 
 import logging
-from typing import List
+from typing import Dict, List, Optional
 
+import torch
 from torch import Tensor
 
 from .chart_state import ChartState
@@ -11,22 +18,13 @@ from .ppca import PPCAEstimator
 
 class ChartBuilder:
     """
-    Builds new chart candidates from features not covered by existing charts.
+    Builds charts from h_chart via PPCA/PCA.
 
-    The builder:
-    1. Identifies features not well-explained by existing charts.
-    2. Clusters uncovered features into candidate components.
-    3. Fits a PPCA model to each component.
-    4. Accepts or rejects candidates via MDL criterion.
+    Phase-6.5: single-chart policy (chart_id=0 per layer).
+    Future: multi-chart with MDL-based acceptance.
     """
 
     def __init__(self, config: dict):
-        """
-        Args:
-            config: chart configuration dict with keys:
-                rank, min_support, max_charts_per_layer,
-                posterior_threshold, entropy_threshold, mdl_lambda.
-        """
         self.config = config
         self.min_support: int = config.get("min_support", 16)
         self.max_charts_per_layer: int = config.get("max_charts_per_layer", 24)
@@ -35,153 +33,101 @@ class ChartBuilder:
         self.posterior_threshold: float = config.get("posterior_threshold", 0.55)
         self.entropy_threshold: float = config.get("entropy_threshold", 1.0)
 
-    def build_candidates(
-        self,
-        h_chart: Tensor,
-        existing_charts: List[ChartState],
-    ) -> List[ChartState]:
-        """
-        Build candidate charts from features.
+    # ------------------------------------------------------------------
+    #  Phase-6.5: single-chart build-or-reuse
+    # ------------------------------------------------------------------
 
-        Args:
-            h_chart: pre-adapter features of shape [B, D].
-            existing_charts: current chart states in this layer.
-
-        Returns:
-            List of new candidate ChartState objects.
-        """
-        raise NotImplementedError("Phase-0 skeleton only.")
-
-    def split_covered_boundary_uncovered(
-        self,
-        h_chart: Tensor,
-        existing_charts: List[ChartState],
-    ):
-        """
-        Split h_chart into covered, boundary, and uncovered subsets.
-
-        Args:
-            h_chart: pre-adapter features of shape [B, D].
-            existing_charts: current chart states.
-
-        Returns:
-            Tuple of (covered_mask, boundary_mask, uncovered_mask).
-        """
-        raise NotImplementedError("Phase-0 skeleton only.")
-
-    def build_candidate_components(self, h_uncovered: Tensor):
-        """
-        Cluster uncovered features into candidate chart components.
-
-        Args:
-            h_uncovered: uncovered features of shape [N, D].
-
-        Returns:
-            List of component feature tensors, each of shape [n_i, D].
-        """
-        raise NotImplementedError("Phase-0 skeleton only.")
-
-    def fit_chart_from_component(
-        self,
-        component_features: Tensor,
-        layer_id: int,
-        chart_id: int,
-    ) -> ChartState:
-        """
-        Fit a PPCA model to a component and create a ChartState.
-
-        Args:
-            component_features: features assigned to this component [n, D].
-            layer_id: ViT block index.
-            chart_id: unique chart id to assign.
-
-        Returns:
-            Initialized ChartState (state='candidate').
-        """
-        raise NotImplementedError("Phase-0 skeleton only.")
-
-    def accept_candidate(
-        self,
-        candidate: ChartState,
-        existing_charts: List[ChartState],
-    ) -> bool:
-        """
-        Decide whether to accept a candidate chart into the atlas.
-
-        Args:
-            candidate: proposed new ChartState.
-            existing_charts: current charts in the layer.
-
-        Returns:
-            True if candidate should be accepted.
-        """
-        raise NotImplementedError("Phase-0 skeleton only.")
-
-    def compute_candidate_mdl_gain(
-        self,
-        candidate: ChartState,
-        h_component: Tensor,
-        existing_charts: List[ChartState],
-    ) -> float:
-        """
-        Compute MDL gain from adding this candidate.
-
-        Args:
-            candidate: proposed chart.
-            h_component: features assigned to candidate [n, D].
-            existing_charts: current charts.
-
-        Returns:
-            MDL gain (positive = better to add chart).
-        """
-        raise NotImplementedError("Phase-0 skeleton only.")
-
-    def build_single_chart_for_layer(
+    def build_or_reuse_single_chart_for_layer(
         self,
         h_chart: Tensor,
         layer_id: int,
+        task_id: int,
+        existing_charts: Optional[List[ChartState]] = None,
         chart_id: int = 0,
     ) -> ChartState:
         """
-        Phase-4: build exactly one chart from all h_chart samples.
+        Phase-6.5 single-chart policy.
 
-        Fits a single PPCA model covering all input features.
-        No clustering, no candidate selection, no MDL.
+        If chart_id already exists: reuse, do not update geometry.
+        Else: fit PPCA from h_chart.
 
         Args:
-            h_chart: features of shape [N, D].
-            layer_id: target layer index (should be 9 in Phase-4).
-            chart_id: chart id to assign (default 0).
+            h_chart: pre-adapter CLS features [N, D]. MUST be permanent-path.
+            layer_id: ViT block index.
+            task_id: current task id (for logging only).
+            existing_charts: previously built charts (optional).
+            chart_id: chart id (default 0).
 
         Returns:
-            ChartState with fitted PPCA parameters.
+            ChartState.
         """
+        if existing_charts:
+            for cs in existing_charts:
+                if cs.chart_id == chart_id and cs.mu is not None:
+                    logging.info(
+                        "[ChartContract] layer=%d chart=%d REUSE "
+                        "definition=feature_geometry method=PPCA/PCA "
+                        "uses_delta_teacher=False uses_label=False "
+                        "support=%d rank=%d sigma_perp=%.4f slots=%s",
+                        layer_id, chart_id, cs.n_support,
+                        cs.U.shape[1] if cs.U is not None else 0,
+                        cs.sigma_perp, cs.slot_ids,
+                    )
+                    return cs
+
         ppca = PPCAEstimator(dim=h_chart.shape[1], rank=self.ppca_rank)
         ppca.fit(h_chart, rank=self.ppca_rank)
         chart_state = ppca.to_chart_state(layer_id=layer_id, chart_id=chart_id)
 
         logging.info(
-            "[L%dChart] layer=%d chart_id=%d support=%d rank=%d sigma_perp=%.4f",
-            layer_id, layer_id, chart_id, chart_state.n_support, ppca.rank, ppca.sigma_perp,
+            "[ChartContract] layer=%d chart=%d BUILD "
+            "definition=feature_geometry method=PPCA/PCA "
+            "uses_delta_teacher=False uses_label=False "
+            "support=%d rank=%d sigma_perp=%.4f radius_d2=%.4f",
+            layer_id, chart_id, chart_state.n_support,
+            ppca.rank, ppca.sigma_perp, chart_state.radius_d2,
         )
         return chart_state
 
-    def assign_or_create_chart(
+    def build_single_chart_for_layer(
+        self, h_chart: Tensor, layer_id: int, chart_id: int = 0,
+    ) -> ChartState:
+        """Legacy wrapper: always builds new chart (no reuse)."""
+        return self.build_or_reuse_single_chart_for_layer(
+            h_chart, layer_id, task_id=-1, existing_charts=None, chart_id=chart_id,
+        )
+
+    # ------------------------------------------------------------------
+    #  Future: multi-chart evaluation (skeleton only)
+    # ------------------------------------------------------------------
+
+    def evaluate_new_chart_need(
         self,
-        h_chart: Tensor,
+        h_uncovered: Tensor,
         existing_charts: List[ChartState],
-    ) -> List[ChartState]:
+    ) -> Dict[str, float]:
         """
-        Assign features to existing charts or create new ones.
+        Future only. Estimate whether uncovered samples require a new chart.
 
-        This is the main entry point called per-task after collecting
-        chart features for the current task.
-
-        Args:
-            h_chart: pre-adapter features of shape [B, D].
-            existing_charts: current chart states (may be empty).
-
-        Returns:
-            Updated list of ChartState (existing + new).
+        Do not use in Phase-6.5.
         """
-        raise NotImplementedError("Phase-0 skeleton only.")
+        raise NotImplementedError("Phase-7+ will implement multi-chart evaluation.")
+
+    # ------------------------------------------------------------------
+    #  Unimplemented (Phase-7+)
+    # ------------------------------------------------------------------
+
+    def build_candidates(self, h_chart, existing_charts):
+        raise NotImplementedError("Phase-7+.")
+    def split_covered_boundary_uncovered(self, h_chart, existing_charts):
+        raise NotImplementedError("Phase-7+.")
+    def build_candidate_components(self, h_uncovered):
+        raise NotImplementedError("Phase-7+.")
+    def fit_chart_from_component(self, comp, layer_id, chart_id):
+        raise NotImplementedError("Phase-7+.")
+    def accept_candidate(self, candidate, existing_charts):
+        raise NotImplementedError("Phase-7+.")
+    def compute_candidate_mdl_gain(self, candidate, h_comp, existing):
+        raise NotImplementedError("Phase-7+.")
+    def assign_or_create_chart(self, h_chart, existing_charts):
+        raise NotImplementedError("Phase-7+.")
