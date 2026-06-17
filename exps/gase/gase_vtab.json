@@ -1,0 +1,111 @@
+{
+    "prefix": "reproduce",
+    "dataset": "vtab",
+    "memory_size": 0,
+    "memory_per_class": 0,
+    "fixed_memory": false,
+    "shuffle": false,
+    "init_cls": 10,
+    "increment": 10,
+    "model_name": "gase",
+    "backbone_type": "pretrained_vit_b16_224_gase",
+    "device": "auto",
+    "seed": [1993],
+
+    "batch_size":32,
+    "weight_decay":0.0005,
+    "min_lr":0,
+    "ffn_adapter_type": "adaptmlp",
+    "ffn_num":16,
+    "optimizer":"sgd",
+    "vpt_type":"shallow",
+    "prompt_token_num":5,
+
+    "func_epoch": 20,
+    "rd_epoch": 20,
+    "init_lr": 0.005,
+    "rd_lr": 0.01,
+    "rd_dim": 128,
+    "buffer_size": 500,
+    "detect_batch_size": 128,
+
+    "exp_threshold": 1,
+    "adapt_start_layer": 9,
+    "adapt_end_layer": 11,
+
+    "method": "gase",
+    "atlas_layers": [9, 10, 11],
+    "adapter_dim": 16,
+
+    "task_adapter": {
+        "bottleneck_dim": 16,
+        "dropout": 0.0,
+        "scale": 1.0
+    },
+
+    "chart": {
+        "max_charts_per_layer": 24,
+        "rank": 8,
+        "min_support": 16,
+        "posterior_threshold": 0.55,
+        "inlier_threshold": 0.75,
+        "entropy_threshold": 1.0,
+        "mdl_lambda": 1.0,
+        "trust_quantile": 0.95,
+        "lifecycle": {
+            "active_min_support": 32,
+            "mature_min_age": 2,
+            "mature_min_reuse": 2,
+            "dormant_patience": 5
+        }
+    },
+
+    "slot": {
+        "max_slots_per_chart": 4,
+        "input_rank": 8,
+        "output_rank": 4,
+        "min_support": 16,
+        "reuse_threshold": 0.25,
+        "new_slot_threshold": 0.45,
+        "router_type": "key",
+        "use_teacher_guided_router": false
+    },
+
+    "chart_adapter": {
+        "type": "linear",
+        "hidden_dim": 8
+    },
+
+    "free_adapter": {
+        "enabled": true,
+        "bottleneck_dim": 16,
+        "dropout": 0.0,
+        "scale": 1.0
+    },
+
+    "routing": {
+        "chart_top_m": 2,
+        "slot_top_k": 2,
+        "use_soft_chart_routing": true,
+        "use_soft_slot_routing": true,
+        "use_identity_fallback": true,
+        "fallback_entropy_threshold": 1.0,
+        "fallback_margin_threshold": 0.05
+    },
+
+    "distill": {
+        "residual_weight": 1.0,
+        "logit_weight": 0.5,
+        "feature_weight": 0.5,
+        "norm_weight": 0.1,
+        "temperature": 2.0,
+        "epochs": 5,
+        "lr": 0.001
+    },
+
+    "calibration": {
+        "enabled": true,
+        "epochs": 3,
+        "lr": 0.0005
+    }
+}

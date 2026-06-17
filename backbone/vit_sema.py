@@ -15,6 +15,7 @@ from timm.models.layers import DropPath
 from timm.models.registry import register_model
 from collections import OrderedDict
 from backbone.sema_block import SEMAModules
+from safetensors.torch import load_file as safetensors_load
 
 
 class Attention(nn.Module):
@@ -258,12 +259,12 @@ class VisionTransformer(nn.Module):
 
 
 def vit_base_patch16_224_sema(pretrained=False, **kwargs):
-    
+
     model = VisionTransformer(patch_size=16, embed_dim=768, depth=12, num_heads=12, mlp_ratio=4, qkv_bias=True,
         norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
 
-    checkpoint_model=timm.create_model("vit_base_patch16_224", pretrained=True, num_classes=0)
-    state_dict = checkpoint_model.state_dict()
+    pretrained_path = kwargs.pop("pretrained_path", "/sdd1/syc/My_code/common/pre-model/1k/sema/sema.safetensors")
+    state_dict = safetensors_load(pretrained_path)
     # modify the checkpoint state dict to match the model
     # first, split qkv weight into q, k, v
     for key in list(state_dict.keys()):
@@ -309,8 +310,8 @@ def vit_base_patch16_224_in21k_sema(pretrained=False, **kwargs):
     model = VisionTransformer(patch_size=16, embed_dim=768, depth=12, num_heads=12, mlp_ratio=4, qkv_bias=True,
         norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
 
-    checkpoint_model=timm.create_model("vit_base_patch16_224_in21k", pretrained=True, num_classes=0)
-    state_dict = checkpoint_model.state_dict()
+    pretrained_path = kwargs.pop("pretrained_path", "/sdd1/syc/My_code/common/pre-model/1k/sema/sema.safetensors")
+    state_dict = safetensors_load(pretrained_path)
     # modify the checkpoint state dict to match the model
     # first, split qkv weight into q, k, v
     for key in list(state_dict.keys()):
@@ -344,7 +345,7 @@ def vit_base_patch16_224_in21k_sema(pretrained=False, **kwargs):
         if name in msg.missing_keys:
             p.requires_grad = True
         else:
-            p.requires_grad = False 
+            p.requires_grad = False
     model.out_dim = 768
     return model
 

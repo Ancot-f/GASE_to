@@ -30,6 +30,9 @@ def get_model(model_name, args):
         from models.memo import Learner
     elif name == "sema":
         from models.sema import Learner
+    # GASE registration
+    elif name == "gase":
+        from models.gase import GASELearner
     else:
         assert 0
     return Learner(args)

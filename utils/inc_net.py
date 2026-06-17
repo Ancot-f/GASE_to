@@ -62,6 +62,50 @@ def get_backbone(args, pretrained=False):
         else:
             raise NotImplementedError("Inconsistent model name and model type")
 
+    elif '_gase' in name:
+        # GASE registration
+        if args["model_name"] == "gase":
+            from backbone import vit_gase
+            from easydict import EasyDict
+            tuning_config = EasyDict(
+                ffn_adapt=True,
+                ffn_option="parallel",
+                ffn_adapter_layernorm_option="none",
+                ffn_adapter_init_option="lora",
+                ffn_adapter_scalar="0.1",
+                ffn_num=args.get("ffn_num", 16),
+                ffn_adapter_type=args.get("ffn_adapter_type", "adaptmlp"),
+                d_model=768,
+                vpt_on=False,
+                vpt_num=0,
+                exp_threshold=args.get("exp_threshold", 2),
+                adapt_start_layer=args.get("adapt_start_layer", 9),
+                adapt_end_layer=args.get("adapt_end_layer", 11),
+            )
+            if name == "pretrained_vit_b16_224_gase":
+                model = vit_gase.ViTGASE(
+                    backbone_name="vit_base_patch16_224",
+                    num_classes=0,
+                    embed_dim=768,
+                    atlas_layers=args.get("atlas_layers", [9, 10, 11]),
+                    config=args,
+                )
+                model.out_dim = 768
+            elif name == "pretrained_vit_b16_224_in21k_gase":
+                model = vit_gase.ViTGASE(
+                    backbone_name="vit_base_patch16_224_in21k",
+                    num_classes=0,
+                    embed_dim=768,
+                    atlas_layers=args.get("atlas_layers", [9, 10, 11]),
+                    config=args,
+                )
+                model.out_dim = 768
+            else:
+                raise NotImplementedError("Unknown type {}".format(name))
+            return model.eval()
+        else:
+            raise NotImplementedError("Inconsistent model name and model type")
+
     elif '_adapter' in name:
         ffn_num = args["ffn_num"]
         if args["model_name"] == "sema":

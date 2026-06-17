@@ -5,10 +5,8 @@ import copy
 import logging
 from backbone.sema_components import Adapter, AE, Records
 
-device = 'cuda' if torch.cuda.is_available() else 'cpu' 
 
-
-class AdapterModule(nn.Module):    
+class AdapterModule(nn.Module):
     def __init__(self, config, adapter_id, writer):
         super().__init__()
         self.config = config
@@ -32,8 +30,8 @@ class AdapterModule(nn.Module):
     def forward(self, x):
         func_out = self.functional(x)
         if self.not_addition_layer:
-            rd_loss = torch.tensor(0.).to(device)
-            return func_out, rd_loss, torch.zeros_like(rd_loss).to(device)
+            rd_loss = torch.tensor(0., device=x.device)
+            return func_out, rd_loss, torch.zeros_like(rd_loss)
         else:
             rd_loss = self.rd.compute_reconstruction_loss(x)
         z_score = self.get_z_score_deviation(rd_loss)
@@ -44,11 +42,11 @@ class AdapterModule(nn.Module):
     def get_z_score_deviation(self, rd_loss):
         mean, stddev = self.rd_loss_record.mean, self.rd_loss_record.stddev
         if not self.rd_loss_record.length > 2:
-            return torch.zeros_like(rd_loss).to(device)
+            return torch.zeros_like(rd_loss)
         z_score = (rd_loss-mean)/stddev
         z_score = torch.abs(z_score)
         return z_score
-    
+
     def add_z_score_record(self, rd_loss):
         self.rd_loss_record.add_record(rd_loss.detach().cpu())
 
@@ -65,23 +63,28 @@ class SEMAModules(nn.Module):
         self.added_for_task = True
         self.adapt_start_layer = config.adapt_start_layer
         self.adapt_end_layer = config.adapt_end_layer
-        # initialize with one adapter
+        # initialize with one adapter — created on CPU, moved later by model.to()
         self.add_adapter(initialize=True)
         self.added_adapter = 0
 
-        self.router = nn.Linear(config.d_model, 1).cuda()
+        # router params stay on CPU until model.to(device) in _train
+        self.router = nn.Linear(config.d_model, 1)
         self.new_router = None
         self.detecting_outlier = False
-        
+
     @property
     def num_adapters(self):
         return len(self.adapters)
 
+    def _resolve_device(self):
+        """Return the device of this module from router weight."""
+        return self.router.weight.device
+
     def set_new_router(self):
-        self.new_router = nn.Linear(self.config.d_model, 1).cuda()
-       
+        self.new_router = nn.Linear(self.config.d_model, 1).to(self._resolve_device())
+
     def fix_router(self):
-        trained_router = nn.Linear(self.config.d_model, len(self.adapters)).cuda()
+        trained_router = nn.Linear(self.config.d_model, len(self.adapters)).to(self._resolve_device())
         old_router = self.router
         weight = copy.deepcopy(old_router.weight.data)
         new_weight = copy.deepcopy(self.new_router.weight.data)
@@ -93,11 +96,13 @@ class SEMAModules(nn.Module):
         trained_router.bias = nn.Parameter(bias)
         self.router = trained_router
         self.new_router = None
-        
+
 
     def add_adapter(self, initialize=False):
         adapter_id = f"{self.layer_id}.{len(self.adapters)}"
-        new_adapter = AdapterModule(self.config, adapter_id, self.writer).to(device)
+        new_adapter = AdapterModule(self.config, adapter_id, self.writer)
+        if not initialize:
+            new_adapter = new_adapter.to(self._resolve_device())
         self.newly_added = True
         self.added_for_task = True
         self.adapters.append(new_adapter)
@@ -106,7 +111,8 @@ class SEMAModules(nn.Module):
         logging.info(f"Adapter {adapter_id} added at block {self.layer_id}")
 
     def forward(self, x):
-        rd_loss = torch.tensor(0.).to(device)
+        d = x.device
+        rd_loss = torch.tensor(0., device=d)
 
         added = False
         not_addition_layer = self.layer_id < self.adapt_start_layer or self.layer_id > self.adapt_end_layer
@@ -115,15 +121,15 @@ class SEMAModules(nn.Module):
         else:
             func_outs, rd_losses, z_scores = [], [], []
             for adapter in self.adapters:
-                func_out, rd_loss, z_score = adapter(x)
-                func_outs.append(func_out)  
-                rd_losses.append(rd_loss)   
+                func_out_out, rd_loss_out, z_score = adapter(x)
+                func_outs.append(func_out_out)
+                rd_losses.append(rd_loss_out)
                 z_scores.append(z_score)
 
             func_outs = torch.stack(func_outs)
             rd_losses = torch.stack(rd_losses)
             z_scores = torch.stack(z_scores)
-            
+
             addition_criteria = z_scores.mean(dim=1).min() > self.config.exp_threshold \
                 and self.layer_id >= self.adapt_start_layer \
                 and self.layer_id <= self.adapt_end_layer \
@@ -131,19 +137,19 @@ class SEMAModules(nn.Module):
 
             if addition_criteria:
                 self.add_adapter()
-                out = {"func_out": torch.zeros_like(func_outs[0]).to(device), "rd_loss": torch.tensor(0.).to(device), "added": True}
+                out = {"func_out": torch.zeros_like(func_outs[0]), "rd_loss": torch.tensor(0., device=d), "added": True}
                 return out
             else:
                 logits = self.router(x.mean(dim=1))
                 if self.new_router is not None:
                     new_logits = self.new_router(x.mean(dim=1))
                     logits = torch.cat([logits, new_logits], dim=1)
-                mask = torch.softmax(logits, dim=1) 
+                mask = torch.softmax(logits, dim=1)
                 func_out = (func_outs * mask.transpose(0,1).unsqueeze(-1).unsqueeze(-1)).sum(dim=0)
                 if self.adapters[-1].newly_added:
                     rd_loss = rd_losses[-1].mean()
                 else:
-                    rd_loss = torch.tensor(0.).to(device)
+                    rd_loss = torch.tensor(0., device=d)
 
         out = {"func_out": func_out, "rd_loss": rd_loss, "added": added}
         return out
@@ -153,7 +159,7 @@ class SEMAModules(nn.Module):
         self.freeze_rd()
         self.reset_newly_added_status()
         self.added_for_task = False
-    
+
 
     def reset_newly_added_status(self):
         self.newly_added = False
