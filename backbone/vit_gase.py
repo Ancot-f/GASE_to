@@ -7,7 +7,7 @@ Wraps a standard timm ViT and injects GASEAtlasBlocks at specified layers
 Does NOT modify vit_sema.py — this is an independent GASE backbone.
 """
 
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -15,7 +15,7 @@ from torch import Tensor
 import timm
 
 from .gase_block import GASEAtlasBlock
-from .gase_components import TASK_TRAIN, DISTILL, INFER
+from .gase_components import TASK_TRAIN, DISTILL, INFER, L9_CHART_STUDENT
 
 
 class ViTGASE(nn.Module):
@@ -245,7 +245,7 @@ class ViTGASE(nn.Module):
         Args:
             mode: one of TASK_TRAIN, DISTILL, INFER.
         """
-        if mode not in (TASK_TRAIN, DISTILL, INFER):
+        if mode not in (TASK_TRAIN, DISTILL, INFER, L9_CHART_STUDENT):
             raise ValueError(f"Unknown adapter_mode: {mode}")
         self.adapter_mode = mode
         for blk in self.blocks:
@@ -305,3 +305,88 @@ class ViTGASE(nn.Module):
         if layer_id < 0 or layer_id >= len(self.blocks):
             raise IndexError(f"layer_id {layer_id} out of range [0, {len(self.blocks)})")
         return self.blocks[layer_id]
+
+    # ------------------------------------------------------------------
+    #  Feature extraction for collection (Phase-3)
+    # ------------------------------------------------------------------
+
+    def extract_layer_chart_feature_and_teacher(
+        self,
+        images: Tensor,
+        layer_id: int,
+    ) -> Tuple[Tensor, Tensor]:
+        """
+        Extract h_chart and task-adapter teacher residual for a target GASE layer.
+
+        Forward through patch embed, positional embed, and blocks 0..layer_id.
+        At the target layer, call extract_h_chart_and_delta_teacher on the
+        GASEAtlasBlock to get h_chart and delta_teacher WITHOUT adding the
+        residual to the block output.
+
+        Phase-3 supports authoritative collection for L9 only.
+        L10/L11 collection will be added in later phases after sequential
+        chart-adapter commitment is implemented.
+
+        Args:
+            images: input images of shape [B, 3, H, W].
+            layer_id: target GASE layer index (e.g., 9).
+
+        Returns:
+            h_chart: pre-adapter CLS feature of shape [B, D].
+            delta_teacher: task_adapter(h_chart) of shape [B, D].
+        """
+        if layer_id not in self.atlas_layers:
+            raise ValueError(
+                f"layer_id {layer_id} is not a GASE atlas layer. "
+                f"atlas_layers={self.atlas_layers}"
+            )
+        if layer_id > 9:
+            raise NotImplementedError(
+                "Phase-3 only supports authoritative L9 collection. "
+                "L10/L11 need sequential chart-adapter commit first."
+            )
+
+        B = images.shape[0]
+        x = self.patch_embed(images)
+        cls_tokens = self.cls_token.expand(B, -1, -1)
+        x = torch.cat((cls_tokens, x), dim=1)
+        x = x + self.pos_embed
+        x = self.pos_drop(x)
+
+        for i, blk in enumerate(self.blocks):
+            if i == layer_id:
+                if not isinstance(blk, GASEAtlasBlock):
+                    raise TypeError(
+                        f"Block at layer {layer_id} is {type(blk).__name__}, "
+                        f"expected GASEAtlasBlock."
+                    )
+                _block_output, h_chart, delta_teacher = blk.extract_h_chart_and_delta_teacher(x)
+                return h_chart, delta_teacher
+            else:
+                if isinstance(blk, GASEAtlasBlock):
+                    x, _routing = blk(x)
+                else:
+                    x = blk(x)
+
+        raise RuntimeError(f"Layer {layer_id} not reached in blocks loop.")
+
+    def compute_teacher_logits(self, images: Tensor) -> Tensor:
+        """
+        Compute logits using the current task-adapter teacher path.
+
+        Temporarily switches to task_train mode, runs full forward pass,
+        and restores the original adapter mode.
+
+        Args:
+            images: input images of shape [B, 3, H, W].
+
+        Returns:
+            Teacher logits of shape [B, num_classes].
+        """
+        prev_mode = self.adapter_mode
+        self.set_adapter_mode(TASK_TRAIN)
+        try:
+            out = self.forward(images)
+            return out["logits"]
+        finally:
+            self.set_adapter_mode(prev_mode)

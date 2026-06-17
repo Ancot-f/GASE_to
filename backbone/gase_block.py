@@ -16,7 +16,7 @@ import torch
 from torch import Tensor
 from torch import nn
 
-from .gase_components import TASK_TRAIN, DISTILL, INFER, RoutingOutput
+from .gase_components import TASK_TRAIN, DISTILL, INFER, L9_CHART_STUDENT, RoutingOutput
 
 
 class GASEAtlasBlock(nn.Module):
@@ -56,6 +56,7 @@ class GASEAtlasBlock(nn.Module):
         self.chart_router: Optional[nn.Module] = None
         self.slot_router: Optional[nn.Module] = None
         self.chart_adapters: Dict[str, nn.Module] = nn.ModuleDict()
+        self.chart_states: Dict[int, object] = {}  # chart_id -> ChartState
         self.free_adapter: Optional[nn.Module] = None
 
         self.adapter_mode: str = INFER
@@ -79,8 +80,10 @@ class GASEAtlasBlock(nn.Module):
 
         1. Pass x through the original ViT block.
         2. Extract h_chart (CLS token).
-        3. In task_train mode: apply task_adapter residual to CLS token.
-        4. In distill/infer mode: Phase-2 identity pass-through.
+        3. Apply adapter residual based on mode:
+           - task_train: task_adapter residual to CLS token.
+           - l9_chart_student: L9 uses chart-adapter, L10/L11 use task_adapter.
+           - distill/infer: Phase-2 identity pass-through.
 
         Args:
             x: input features of shape [B, N, D].
@@ -95,6 +98,24 @@ class GASEAtlasBlock(nn.Module):
             h_chart = self.get_router_feature(x)
             delta_task = self.apply_task_adapter(h_chart)
             x = self.add_delta_to_cls(x, delta_task)
+
+        elif self.adapter_mode == L9_CHART_STUDENT:
+            h_chart = self.get_router_feature(x)
+            if self.layer_id == 9 and len(self.chart_adapters) > 0 and len(self.chart_states) > 0:
+                # L9: use first chart-adapter with its chart mu
+                # Take the first (chart_id, slot_id) pair
+                first_adapter_key = next(iter(self.chart_adapters))
+                adapter = self.chart_adapters[first_adapter_key]
+                # Get corresponding chart state (chart_id=0)
+                chart_state = self.chart_states.get(0)
+                if chart_state is not None and chart_state.mu is not None:
+                    mu = chart_state.mu.to(x.device)
+                    delta_chart = adapter(h_chart, mu)
+                    x = self.add_delta_to_cls(x, delta_chart)
+            elif self.layer_id in (10, 11) and self.task_adapter is not None:
+                # L10/L11: still use task_adapter teacher for isolation
+                delta_task = self.apply_task_adapter(h_chart)
+                x = self.add_delta_to_cls(x, delta_task)
 
         routing_info = None
         return x, routing_info
@@ -239,6 +260,32 @@ class GASEAtlasBlock(nn.Module):
             return total
 
     # ------------------------------------------------------------------
+    #  Feature extraction for collection (Phase-3)
+    # ------------------------------------------------------------------
+
+    def extract_h_chart_and_delta_teacher(self, x: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
+        """
+        Run original block, extract h_chart, and compute task-adapter teacher residual.
+
+        This method is used by FeatureCollector. It does NOT add the residual
+        back to the block output — it only computes and returns the values.
+
+        Args:
+            x: input features of shape [B, N, D] or [B, D].
+
+        Returns:
+            block_output: Tensor with same shape as x after original_block,
+                          before adding any adapter residual.
+            h_chart: CLS feature of shape [B, D] seen by the router.
+            delta_teacher: task_adapter(h_chart) of shape [B, D],
+                           or zeros if task_adapter is None.
+        """
+        block_output = self.forward_original_block(x)
+        h_chart = self.get_router_feature(block_output)
+        delta_teacher = self.apply_task_adapter(h_chart)
+        return block_output, h_chart, delta_teacher
+
+    # ------------------------------------------------------------------
     #  Mode & registration
     # ------------------------------------------------------------------
 
@@ -247,11 +294,15 @@ class GASEAtlasBlock(nn.Module):
         Set the adapter mode.
 
         Args:
-            mode: one of TASK_TRAIN, DISTILL, INFER.
+            mode: one of TASK_TRAIN, DISTILL, INFER, L9_CHART_STUDENT.
         """
-        if mode not in (TASK_TRAIN, DISTILL, INFER):
+        if mode not in (TASK_TRAIN, DISTILL, INFER, L9_CHART_STUDENT):
             raise ValueError(f"Unknown adapter_mode: {mode}")
         self.adapter_mode = mode
+
+    def register_chart(self, chart_state: object) -> None:
+        """Register a ChartState for this block's atlas."""
+        self.chart_states[chart_state.chart_id] = chart_state
 
     def register_chart_adapter(
         self,

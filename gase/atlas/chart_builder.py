@@ -1,10 +1,12 @@
 """ChartBuilder: discovers and initializes new charts from uncovered features."""
 
+import logging
 from typing import List
 
 from torch import Tensor
 
 from .chart_state import ChartState
+from .ppca import PPCAEstimator
 
 
 class ChartBuilder:
@@ -133,6 +135,36 @@ class ChartBuilder:
             MDL gain (positive = better to add chart).
         """
         raise NotImplementedError("Phase-0 skeleton only.")
+
+    def build_single_chart_for_layer(
+        self,
+        h_chart: Tensor,
+        layer_id: int,
+        chart_id: int = 0,
+    ) -> ChartState:
+        """
+        Phase-4: build exactly one chart from all h_chart samples.
+
+        Fits a single PPCA model covering all input features.
+        No clustering, no candidate selection, no MDL.
+
+        Args:
+            h_chart: features of shape [N, D].
+            layer_id: target layer index (should be 9 in Phase-4).
+            chart_id: chart id to assign (default 0).
+
+        Returns:
+            ChartState with fitted PPCA parameters.
+        """
+        ppca = PPCAEstimator(dim=h_chart.shape[1], rank=self.ppca_rank)
+        ppca.fit(h_chart, rank=self.ppca_rank)
+        chart_state = ppca.to_chart_state(layer_id=layer_id, chart_id=chart_id)
+
+        logging.info(
+            "[L9Chart] layer=%d chart_id=%d support=%d rank=%d sigma_perp=%.4f",
+            layer_id, chart_id, chart_state.n_support, ppca.rank, ppca.sigma_perp,
+        )
+        return chart_state
 
     def assign_or_create_chart(
         self,

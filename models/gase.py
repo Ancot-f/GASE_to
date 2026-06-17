@@ -60,6 +60,7 @@ class GASELearner(BaseLearner):
 
         # Phase flag
         self.phase: str = args.get("phase", "task_adapter_only")
+        self.phase4_report: Optional[Dict] = None
 
         logging.info(
             "GASELearner Phase-2 initialized. atlas_layers=%s, adapter_dim=%d",
@@ -293,9 +294,25 @@ class GASELearner(BaseLearner):
         pass
 
     def after_task(self):
-        """Post-task cleanup. Phase-2: keep task adapters for eval."""
+        """Post-task cleanup. Phase-3/4: optionally run collection + distillation."""
         self._known_classes = self._total_classes
         logging.info("Task %d completed. known_classes=%d", self._cur_task, self._known_classes)
+
+        # Phase-3: run L9 feature collection if configured
+        if self.phase == "feature_collect" and self._cur_task == 0:
+            logging.info("[GASE] Phase-3: collecting L9 features for task 0...")
+            self.collect_chart_features_for_task(
+                task_id=self._cur_task, data_loader=self.train_loader
+            )
+
+        # Phase-4: collect + distill + eval
+        if self.phase == "l9_one_chart_one_slot" and self._cur_task == 0:
+            logging.info("[GASE] Phase-4: L9 one-chart one-slot distillation...")
+            self.collect_chart_features_for_task(
+                task_id=self._cur_task, data_loader=self.train_loader
+            )
+            self.distill_l9_one_chart_one_slot(task_id=self._cur_task)
+            self.evaluate_l9_student_vs_teacher(self.test_loader)
 
     # ==================================================================
     #  Reports (minimal debug versions)
@@ -331,6 +348,118 @@ class GASELearner(BaseLearner):
     #  Unimplemented (Phase-3+)
     # ==================================================================
 
+    # ==================================================================
+    #  Phase-4: L9 one-chart one-slot distillation
+    # ==================================================================
+
+    def distill_l9_one_chart_one_slot(self, task_id: int) -> Dict:
+        """
+        Phase-4 pipeline:
+          1. Read L9 LayerFeatureBatch from self.distill_cache.
+          2. Build one ChartState (PPCA).
+          3. Build one SlotState (cross-covariance SVD).
+          4. Fit one LinearChartAdapter (ridge regression).
+          5. Register adapter + chart into L9 GASEAtlasBlock.
+          6. Print and return metrics.
+
+        Args:
+            task_id: current task id.
+
+        Returns:
+            Dict with chart, slot, distill metrics.
+        """
+        from gase.atlas.chart_builder import ChartBuilder
+        from gase.slots.slot_builder import SlotBuilder
+        from gase.distill.chart_distiller import ChartAdapterDistiller
+
+        # 1. Get cached L9 features
+        batch = self.distill_cache.get_layer_cache(9)
+        h_chart = batch.h_chart.to(self._device)
+        delta_teacher = batch.delta_teacher.to(self._device)
+
+        logging.info(
+            "[L9Distill] Starting one-chart one-slot distillation, task=%d samples=%d",
+            task_id, h_chart.shape[0],
+        )
+
+        # 2. Build one chart
+        chart_builder = ChartBuilder(self.args.get("chart", {}))
+        chart_state = chart_builder.build_single_chart_for_layer(
+            h_chart, layer_id=9, chart_id=0
+        )
+        self.chart_atlases[9] = [chart_state]
+
+        # 3. Build one slot
+        slot_builder = SlotBuilder(self.args.get("slot", {}))
+        slot_state = slot_builder.create_single_slot_from_residuals(
+            chart_state, h_chart, delta_teacher, task_id=task_id, slot_id=0
+        )
+
+        # 4. Fit LinearChartAdapter
+        distiller = ChartAdapterDistiller(self.args.get("distill", {}))
+        adapter, metrics = distiller.fit_linear_chart_adapter(
+            chart_state, slot_state, h_chart, delta_teacher
+        )
+
+        # 5. Register into L9 GASEAtlasBlock
+        blk_l9 = self._network.backbone.get_block(9)
+        blk_l9.register_chart(chart_state)
+        blk_l9.register_chart_adapter(
+            chart_id=0, slot_id=0, adapter=adapter
+        )
+
+        # 6. Save report
+        self.phase4_report = {
+            "chart": chart_state.to_dict(),
+            "slot": slot_state.to_dict(),
+            "distill": metrics,
+        }
+
+        return self.phase4_report
+
+    def evaluate_l9_student_vs_teacher(self, test_loader) -> Dict:
+        """
+        Compare full teacher path and L9 chart-student path.
+
+        Teacher: L9/L10/L11 use task_adapter (TASK_TRAIN mode).
+        Student: L9 uses chart_adapter, L10/L11 use task_adapter.
+
+        Args:
+            test_loader: test DataLoader.
+
+        Returns:
+            Dict with teacher_acc, student_acc, gap.
+        """
+        backbone = self._network.backbone
+
+        # Teacher eval
+        backbone.set_adapter_mode("task_train")
+        teacher_acc = self._compute_accuracy(self._network, test_loader)
+
+        # Student eval (L9 chart, L10/L11 task_adapter)
+        backbone.set_adapter_mode("l9_chart_student")
+        student_acc = self._compute_accuracy(self._network, test_loader)
+
+        # Restore
+        backbone.set_adapter_mode("task_train")
+
+        gap = teacher_acc - student_acc
+        logging.info(
+            "[L9StudentEval] teacher_acc=%.2f student_acc=%.2f gap=%.2f",
+            teacher_acc, student_acc, gap,
+        )
+
+        eval_metrics = {
+            "teacher_acc": float(teacher_acc),
+            "student_acc": float(student_acc),
+            "gap": float(gap),
+        }
+
+        if self.phase4_report is not None:
+            self.phase4_report["eval"] = eval_metrics
+
+        return eval_metrics
+
     def train_task_adapter(self, task_id: int, train_loader: DataLoader) -> None:
         raise NotImplementedError("Phase-2 uses _train() directly.")
 
@@ -338,7 +467,40 @@ class GASELearner(BaseLearner):
         raise NotImplementedError("Phase-3+ will freeze after distillation.")
 
     def collect_chart_features_for_task(self, task_id: int, data_loader) -> None:
-        raise NotImplementedError("Phase-3+ will implement feature collection.")
+        """
+        Phase-3 feature collection: collect authoritative L9 h_chart and delta_teacher.
+
+        Creates a FeatureCollector, collects L9 features from the current
+        task training data, and stores the result in self.distill_cache.
+
+        Does NOT build charts or slots (Phase-4+).
+
+        Args:
+            task_id: current task index.
+            data_loader: DataLoader for the current task's training data.
+        """
+        from gase.distill.feature_collector import FeatureCollector
+        from gase.distill.cache import DistillCache
+
+        logging.info("[GASE] Starting L9 feature collection for task %d...", task_id)
+
+        collector = FeatureCollector(
+            model=self._network,
+            atlas_layers=[9],
+            device=self._device,
+            collect_mode="sequential",
+        )
+
+        l9_batch = collector.collect_l9_features(data_loader, task_id)
+
+        if self.distill_cache is None:
+            self.distill_cache = DistillCache()
+        self.distill_cache.add_layer_batch(9, l9_batch)
+
+        cache_summary = self.distill_cache.summary()
+        logging.info("[GASE] DistillCache summary: %s", cache_summary)
+
+        return l9_batch
 
     def build_or_update_atlas(self, task_id: int) -> None:
         raise NotImplementedError("Phase-3+ will implement chart construction.")

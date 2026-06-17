@@ -5,6 +5,7 @@ from torch import Tensor
 from torch import nn
 
 from .chart_state import ChartState
+from ..geometry.pca import compute_pca_basis, project_to_basis, reconstruct_from_basis
 
 
 class PPCAEstimator(nn.Module):
@@ -13,9 +14,6 @@ class PPCAEstimator(nn.Module):
 
     Models h = mu + U * z + epsilon, where z ~ N(0, diag(eigvals))
     and epsilon ~ N(0, sigma_perp * I).
-
-    This provides a low-rank Gaussian approximation of the
-    feature distribution within a chart.
     """
 
     def __init__(self, dim: int, rank: int):
@@ -27,16 +25,39 @@ class PPCAEstimator(nn.Module):
         super().__init__()
         self.dim = dim
         self.rank = rank
+        self.mu: Tensor = torch.zeros(dim)
+        self.U: Tensor = torch.zeros(dim, rank)
+        self.eigvals: Tensor = torch.zeros(rank)
+        self.sigma_perp: float = 1.0
+        self.n_support: int = 0
 
-    def fit(self, h_chart: Tensor, rank: int) -> None:
+    def fit(self, h_chart: Tensor, rank: int) -> "PPCAEstimator":
         """
-        Fit PPCA parameters to data via EM or analytic solution.
+        Fit PPCA parameters via PCA + residual variance estimation.
 
         Args:
             h_chart: features of shape [N, D].
-            rank: rank to use (may differ from initialized rank).
+            rank: PCA rank to use.
+
+        Returns:
+            self
         """
-        raise NotImplementedError("Phase-0 skeleton only.")
+        if h_chart.shape[0] < 2:
+            raise ValueError(f"Need at least 2 samples, got {h_chart.shape[0]}")
+
+        actual_rank = min(rank, h_chart.shape[0] - 1, self.dim)
+        self.rank = actual_rank
+
+        self.mu, self.U, self.eigvals = compute_pca_basis(h_chart, actual_rank)
+        self.n_support = h_chart.shape[0]
+
+        # Compute sigma_perp from reconstruction residual
+        z = project_to_basis(h_chart, self.U, self.mu)
+        h_rec = reconstruct_from_basis(z, self.U, self.mu)
+        residuals = h_chart - h_rec
+        self.sigma_perp = float(residuals.pow(2).mean().sqrt())
+
+        return self
 
     def transform(self, h_chart: Tensor) -> Tensor:
         """
@@ -48,7 +69,7 @@ class PPCAEstimator(nn.Module):
         Returns:
             Latent codes of shape [B, rank].
         """
-        raise NotImplementedError("Phase-0 skeleton only.")
+        return project_to_basis(h_chart, self.U, self.mu)
 
     def inverse_transform(self, z: Tensor) -> Tensor:
         """
@@ -60,25 +81,13 @@ class PPCAEstimator(nn.Module):
         Returns:
             Reconstructed features of shape [B, D].
         """
-        raise NotImplementedError("Phase-0 skeleton only.")
+        return reconstruct_from_basis(z, self.U, self.mu)
 
     def nll(self, h_chart: Tensor) -> Tensor:
-        """
-        Compute per-sample negative log-likelihood under PPCA model.
+        """Per-sample negative log-likelihood (placeholder — Phase-5+)."""
+        raise NotImplementedError("Phase-4 does not implement NLL.")
 
-        Args:
-            h_chart: features of shape [B, D].
-
-        Returns:
-            NLL values of shape [B].
-        """
-        raise NotImplementedError("Phase-0 skeleton only.")
-
-    def to_chart_state(
-        self,
-        layer_id: int,
-        chart_id: int,
-    ) -> ChartState:
+    def to_chart_state(self, layer_id: int, chart_id: int) -> ChartState:
         """
         Export current PPCA parameters to a ChartState.
 
@@ -89,4 +98,23 @@ class PPCAEstimator(nn.Module):
         Returns:
             ChartState with mu, U, eigvals, sigma_perp populated.
         """
-        raise NotImplementedError("Phase-0 skeleton only.")
+        return ChartState(
+            chart_id=chart_id,
+            layer_id=layer_id,
+            mu=self.mu.clone().detach(),
+            U=self.U.clone().detach(),
+            eigvals=self.eigvals.clone().detach(),
+            sigma_perp=self.sigma_perp,
+            prior=1.0,
+            trust_nll=0.0,
+            radius_d2=0.0,
+            n_support=self.n_support,
+            age=0,
+            hit_count=0,
+            reuse_count=0,
+            state="active",
+            slot_ids=[],
+            quality={},
+            created_task_id=-1,
+            last_updated_task_id=-1,
+        )

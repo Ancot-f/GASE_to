@@ -1,6 +1,10 @@
-"""DistillCache: stores and manages collected features for distillation."""
+"""DistillCache: stores and manages collected features for distillation.
 
-from typing import Dict, List, Optional
+Phase-3: stores one LayerFeatureBatch per layer (single concatenated batch).
+Phase-4+: will support multi-pass accumulation via list of batches.
+"""
+
+from typing import Any, Dict, List, Optional, Union
 
 from torch import Tensor
 
@@ -15,37 +19,56 @@ class DistillCache:
     feature collection phase. Provides efficient access patterns
     for chart building, slot construction, and adapter distillation.
 
-    The cache accumulates data across multiple data-loader passes
-    and provides device management for GPU training.
+    Phase-3: stores a single LayerFeatureBatch per layer (all samples
+    concatenated into one batch). Phase-4+ may add multi-pass support.
     """
 
     def __init__(self):
         """Initialize empty cache."""
-        self._cache: Dict[int, List[LayerFeatureBatch]] = {}
+        self._cache: Dict[int, Union[LayerFeatureBatch, List[LayerFeatureBatch]]] = {}
 
     def add_layer_batch(self, layer_id: int, batch: LayerFeatureBatch) -> None:
         """
         Add a LayerFeatureBatch to the cache for a given layer.
 
+        If a batch already exists for this layer, it is replaced.
+        For multi-pass accumulation, use add_layer_batch_list.
+
         Args:
             layer_id: ViT block index.
             batch: LayerFeatureBatch to store.
         """
+        self._cache[layer_id] = batch
+
+    def add_layer_batch_list(self, layer_id: int, batch: LayerFeatureBatch) -> None:
+        """
+        Append a batch to the list for this layer (multi-pass accumulation).
+
+        Args:
+            layer_id: ViT block index.
+            batch: LayerFeatureBatch to append.
+        """
         if layer_id not in self._cache:
             self._cache[layer_id] = []
-        self._cache[layer_id].append(batch)
+        lst = self._cache[layer_id]
+        if not isinstance(lst, list):
+            lst = [lst]
+            self._cache[layer_id] = lst
+        lst.append(batch)
 
-    def get_layer_cache(self, layer_id: int) -> List[LayerFeatureBatch]:
+    def get_layer_cache(
+        self, layer_id: int
+    ) -> Optional[Union[LayerFeatureBatch, List[LayerFeatureBatch]]]:
         """
-        Retrieve all cached batches for a layer.
+        Retrieve cached data for a layer.
 
         Args:
             layer_id: ViT block index.
 
         Returns:
-            List of LayerFeatureBatch (empty list if layer not cached).
+            LayerFeatureBatch, list of batches, or None.
         """
-        return self._cache.get(layer_id, [])
+        return self._cache.get(layer_id, None)
 
     def clear(self) -> None:
         """Remove all cached data and free memory."""
@@ -58,28 +81,32 @@ class DistillCache:
         Args:
             device: torch device.
         """
-        for layer_batches in self._cache.values():
-            for batch in layer_batches:
-                batch.h_chart = batch.h_chart.to(device)
-                if batch.delta_teacher is not None:
-                    batch.delta_teacher = batch.delta_teacher.to(device)
-                if batch.teacher_logits is not None:
-                    batch.teacher_logits = batch.teacher_logits.to(device)
-                if batch.labels is not None:
-                    batch.labels = batch.labels.to(device)
+        for value in self._cache.values():
+            if isinstance(value, list):
+                for batch in value:
+                    batch.to(device)
+            else:
+                value.to(device)
 
-    def summary(self) -> Dict[int, Dict[str, int]]:
+    def summary(self) -> Dict[int, Dict[str, Any]]:
         """
         Return a summary of cached data.
 
         Returns:
-            Dict mapping layer_id -> {"num_batches": int, "num_samples": int}.
+            Dict mapping layer_id -> summary dict with shapes and stats.
         """
-        summary_dict = {}
-        for layer_id, batches in self._cache.items():
-            num_samples = sum(b.h_chart.shape[0] for b in batches)
-            summary_dict[layer_id] = {
-                "num_batches": len(batches),
-                "num_samples": num_samples,
-            }
+        summary_dict: Dict[int, Dict[str, Any]] = {}
+        for layer_id, value in self._cache.items():
+            if isinstance(value, list):
+                num_batches = len(value)
+                num_samples = sum(
+                    b.h_chart.shape[0] for b in value if b.h_chart is not None
+                )
+                summary_dict[layer_id] = {
+                    "num_batches": num_batches,
+                    "num_samples": num_samples,
+                    "first_batch_summary": value[0].summary() if value else {},
+                }
+            else:
+                summary_dict[layer_id] = value.summary()
         return summary_dict
