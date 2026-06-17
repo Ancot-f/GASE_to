@@ -62,8 +62,9 @@ class ViTGASE(nn.Module):
         self.classifier: Optional[nn.Module] = None
         self.use_cls_token: bool = True
         self.adapter_mode: str = INFER
+        self.out_dim: int = embed_dim
 
-        self.build_backbone()
+        # build_backbone() is deferred to Phase-2+ when real ViT loading is needed.
 
     def build_backbone(self) -> None:
         """

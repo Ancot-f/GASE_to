@@ -234,24 +234,41 @@ class GASELearner(BaseLearner):
         Generate a report on current atlas state.
 
         Returns:
-            Dict with per-layer chart summaries.
+            Dict with per-layer chart summaries (empty in Phase-1).
         """
-        raise NotImplementedError("Phase-0 skeleton only.")
+        return {
+            "phase": 1,
+            "num_layers": len(self.atlas_layers),
+            "atlas_layers": self.atlas_layers,
+            "charts_per_layer": {
+                lid: len(charts) for lid, charts in self.chart_atlases.items()
+            },
+        }
 
     def report_routing_state(self) -> Dict:
         """
         Generate a report on current routing behavior.
 
         Returns:
-            Dict with routing statistics.
+            Dict with routing statistics (empty in Phase-1).
         """
-        raise NotImplementedError("Phase-0 skeleton only.")
+        return {
+            "phase": 1,
+            "use_soft_chart_routing": self.use_soft_chart_routing,
+            "use_slot_router": self.use_slot_router,
+            "use_free_adapter": self.use_free_adapter,
+        }
 
     def report_distillation_state(self) -> Dict:
         """
         Generate a report on current distillation quality.
 
         Returns:
-            Dict with distillation metrics.
+            Dict with distillation metrics (empty in Phase-1).
         """
-        raise NotImplementedError("Phase-0 skeleton only.")
+        return {
+            "phase": 1,
+            "distill_cache_samples": (
+                self.distill_cache.summary() if self.distill_cache is not None else {}
+            ),
+        }

@@ -94,7 +94,24 @@ class GASEAtlasBlock(nn.Module):
         Returns:
             Tuple of (output [B, N, D], optional RoutingOutput).
         """
-        raise NotImplementedError("Phase-0 skeleton only.")
+        x = self.forward_original_block(x)
+        routing_info = None
+
+        if self.adapter_mode == TASK_TRAIN and self.task_adapter is not None:
+            h_chart = self.get_router_feature(x)
+            delta_task = self.apply_task_adapter(h_chart)
+            # Apply residual to CLS token (index 0)
+            if x.dim() == 3 and x.shape[1] > 1 and delta_task.shape == x[:, 0].shape:
+                x = x.clone()
+                x[:, 0] = x[:, 0] + delta_task
+        elif self.adapter_mode == DISTILL:
+            # Placeholder: in real impl, collect h_chart and delta_teacher for caching.
+            pass
+        elif self.adapter_mode == INFER:
+            # Phase-1: identity (chart/slot routing not yet implemented).
+            pass
+
+        return x, routing_info
 
     def forward_original_block(self, x: Tensor) -> Tensor:
         """
@@ -106,7 +123,7 @@ class GASEAtlasBlock(nn.Module):
         Returns:
             Output features [B, N, D].
         """
-        raise NotImplementedError("Phase-0 skeleton only.")
+        return self.original_block(x)
 
     def get_router_feature(self, x: Tensor) -> Tensor:
         """
@@ -119,9 +136,11 @@ class GASEAtlasBlock(nn.Module):
             x: input features [B, N, D].
 
         Returns:
-            h_chart of shape [B, D] (typically cls token or pooled).
+            h_chart of shape [B, D] (cls token).
         """
-        raise NotImplementedError("Phase-0 skeleton only.")
+        if x.dim() == 3:
+            return x[:, 0]  # CLS token
+        return x  # already [B, D]
 
     def apply_task_adapter(self, h_chart: Tensor) -> Tensor:
         """
@@ -133,7 +152,9 @@ class GASEAtlasBlock(nn.Module):
         Returns:
             delta_task of shape [B, D].
         """
-        raise NotImplementedError("Phase-0 skeleton only.")
+        if self.task_adapter is None:
+            return torch.zeros_like(h_chart)
+        return self.task_adapter(h_chart)
 
     def apply_chart_adapters(
         self,
@@ -152,7 +173,8 @@ class GASEAtlasBlock(nn.Module):
         Returns:
             delta_chart of shape [B, D].
         """
-        raise NotImplementedError("Phase-0 skeleton only.")
+        # Phase-1 placeholder: return zeros. Real routing in Phase-2+.
+        return torch.zeros_like(h_chart)
 
     def apply_free_adapter(self, h_chart: Tensor) -> Tensor:
         """
@@ -164,7 +186,9 @@ class GASEAtlasBlock(nn.Module):
         Returns:
             delta_free of shape [B, D].
         """
-        raise NotImplementedError("Phase-0 skeleton only.")
+        if self.free_adapter is None:
+            return torch.zeros_like(h_chart)
+        return self.free_adapter(h_chart)
 
     def combine_residuals(
         self,
@@ -190,7 +214,17 @@ class GASEAtlasBlock(nn.Module):
         Returns:
             Combined residual delta_total of shape [B, D].
         """
-        raise NotImplementedError("Phase-0 skeleton only.")
+        if self.adapter_mode == TASK_TRAIN:
+            return delta_task if delta_task is not None else torch.zeros(1)
+        elif self.adapter_mode == INFER:
+            total = torch.zeros(1)
+            if delta_chart is not None:
+                total = total + delta_chart
+            if delta_free is not None and self.use_free_adapter:
+                total = total + delta_free
+            return total
+        else:
+            return delta_task if delta_task is not None else torch.zeros(1)
 
     def set_adapter_mode(self, mode: str) -> None:
         """
