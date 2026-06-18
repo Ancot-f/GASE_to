@@ -78,6 +78,13 @@ class GASELearner(BaseLearner):
             "GASELearner Phase-2 initialized. atlas_layers=%s, adapter_dim=%d",
             self.atlas_layers, self.adapter_dim,
         )
+        routing_cfg = args.get("routing", {})
+        logging.info("[RoutingConfig] slot_router=%s", routing_cfg.get("slot_router", "shared_q_mahalanobis"))
+        logging.info("[RoutingConfig] use_shared_router_basis=%s", routing_cfg.get("use_shared_router_basis", True))
+        logging.info("[RoutingConfig] per_sample=%s", routing_cfg.get("per_sample", True))
+        logging.info("[RoutingConfig] path_consistent=%s", routing_cfg.get("path_consistent", True))
+        logging.info("[RoutingConfig] path_decider_layer=%d", routing_cfg.get("path_decider_layer", 9))
+        logging.info("[RoutingConfig] diagnostics=%s", routing_cfg.get("diagnostics", True))
 
     # ==================================================================
     #  Incremental training entry point (called by trainer.py)
@@ -398,9 +405,20 @@ class GASELearner(BaseLearner):
                 self.distill_sequential_multi_slot_for_task(
                     task_id=self._cur_task, train_loader=self.train_loader,
                 )
-                self.evaluate_oracle_slot_student(self.test_loader)
-                self.evaluate_key_slot_student(self.test_loader)
-                self.evaluate_path_key_slot_student(self.test_loader)
+                oracle_result = self.evaluate_oracle_slot_student(self.test_loader)
+                key_result = self.evaluate_key_slot_student(self.test_loader)
+                path_result = self.evaluate_path_key_slot_student(self.test_loader)
+                agg_result = self.evaluate_aggregated_path_key_slot_student(self.test_loader)
+
+                if oracle_result and key_result and path_result:
+                    logging.info(
+                        "[EvalCompare] Oracle=%.2f PerLayerKey=%.2f PathKey=%.2f AggPath=%.2f "
+                        "Oracle-Key_gap=%.2f Default=PerLayerKey",
+                        oracle_result.get("top1", 0), key_result.get("top1", 0),
+                        path_result.get("top1", 0), agg_result.get("top1", 0),
+                        oracle_result.get("top1", 0) - key_result.get("top1", 0),
+                    )
+                self._save_metrics_json()
 
     # ==================================================================
     #  Reports (minimal debug versions)
@@ -646,20 +664,23 @@ class GASELearner(BaseLearner):
 
     def evaluate_key_slot_student(self, data_loader) -> Dict:
         """
-        Evaluate using per-sample key slot routing (KEY_SLOT_STUDENT mode).
+        Evaluate using per-sample per-layer key slot routing (default GASE inference).
 
-        Phase-7: each sample independently selects the nearest slot
-        via Mahalanobis distance in P-space.
+        Collects routing diagnostics and logs slot histograms, routing_acc, etc.
         """
         backbone = self._network.backbone
         backbone.eval()
 
         all_preds, all_labels_list = [], []
+        routing_records: List[Dict] = []
 
         with torch.no_grad():
             for _, inputs, targets in data_loader:
                 inputs = inputs.to(self._device)
                 logits = backbone.compute_key_slot_logits(inputs)
+                routing_info = backbone.collect_last_routing_info()
+                routing_records.append(routing_info)
+
                 logits = logits[:, :self._total_classes]
                 topk_preds = torch.topk(logits, k=self.topk, dim=1, largest=True, sorted=True)[1]
                 all_preds.append(topk_preds.cpu().numpy())
@@ -669,10 +690,16 @@ class GASELearner(BaseLearner):
         y_true = np.concatenate(all_labels_list)
         result = self._evaluate(y_pred, y_true)
 
-        logging.info("[PerSampleKeySlotEval] total=%.2f", result["top1"])
+        logging.info("[PerLayerKeySlotEval] total=%.2f", result["top1"])
         for key, val in sorted(result["grouped"].items()):
             if "-" in key:
-                logging.info("[PerSampleKeySlotEval] %s=%.2f", key, val)
+                logging.info("[PerLayerKeySlotEval] %s=%.2f", key, val)
+
+        # Routing diagnostics
+        if routing_records and routing_records[0].get("per_layer"):
+            from gase.diagnostics.routing_diagnostics import summarize_routing_records
+            summarize_routing_records(routing_records, torch.from_numpy(y_true),
+                                      self.args.get("increment", 10), mode="per_layer")
 
         self.phase6_key_eval = result
         return result
@@ -681,21 +708,109 @@ class GASELearner(BaseLearner):
     #  Phase-7.5: Path-level consistent slot routing eval
     # ------------------------------------------------------------------
 
+    def _save_metrics_json(self):
+        """Save Oracle/Key/Path metrics to JSON after each task."""
+        import json, os
+        try:
+            log_dir = f"logs/gase_metrics/{self.args.get('prefix', 'gase')}"
+            os.makedirs(log_dir, exist_ok=True)
+            path = f"{log_dir}/task{self._cur_task}_metrics.json"
+            data = {
+                "task_id": self._cur_task, "known_classes": self._known_classes,
+                "oracle": {"top1": float(self.phase6_oracle_eval["top1"]) if self.phase6_oracle_eval else None},
+                "per_layer_key": {"top1": float(self.phase6_key_eval["top1"]) if self.phase6_key_eval else None},
+            }
+            with open(path, "w") as f:
+                json.dump(data, f, indent=2)
+            logging.info("[MetricsJSON] saved to %s", path)
+        except Exception as e:
+            logging.warning("[MetricsJSON] save failed: %s", e)
+
+    def evaluate_aggregated_path_key_slot_student(self, data_loader) -> Dict:
+        """
+        Slow diagnostic: for each candidate slot, compute consistent-path
+        distance aggregated across L9/L10/L11, then choose best path.
+
+        This is an ablation, not the default inference.
+        """
+        backbone = self._network.backbone
+        backbone.eval()
+        all_preds, all_labels_list = [], []
+        increment = self.args.get("increment", 10)
+
+        with torch.no_grad():
+            for _, inputs, targets in data_loader:
+                inputs = inputs.to(self._device)
+                # Determine available slots from L9
+                l9_blk = backbone.get_block(self.atlas_layers[0])
+                available_slots = l9_blk.get_available_slot_ids(0)
+                if len(available_slots) <= 1:
+                    logits = backbone.compute_path_key_slot_logits(inputs)
+                else:
+                    B = inputs.shape[0]
+                    all_slot_scores = torch.zeros(B, len(available_slots), device=self._device)
+                    for idx, sid in enumerate(available_slots):
+                        backbone._clear_path_slot_ids()
+                        for lid in self.atlas_layers:
+                            blk = backbone.blocks[lid]
+                            blk.path_slot_id = torch.full([B], sid, device=self._device, dtype=torch.long)
+                        backbone.set_adapter_mode("path_key_slot_student")
+                        try:
+                            _ = backbone.forward(inputs)
+                        finally:
+                            backbone.set_adapter_mode("task_train")
+                        for lid in self.atlas_layers:
+                            blk = backbone.blocks[lid]
+                            if hasattr(blk, "last_routing_info") and blk.last_routing_info is not None:
+                                s = blk.last_routing_info.get("scores")
+                                if s is not None and idx < s.shape[1]:
+                                    n = min(B, s.shape[0])
+                                    all_slot_scores[:n, idx] += s[:n, idx]
+                    best_slot_ids = all_slot_scores.argmax(dim=1)
+                    backbone._clear_path_slot_ids()
+                    for lid in self.atlas_layers:
+                        blk = backbone.blocks[lid]
+                        blk.path_slot_id = best_slot_ids
+                    backbone.set_adapter_mode("path_key_slot_student")
+                    try:
+                        out = backbone.forward(inputs)
+                        logits = out["logits"]
+                    finally:
+                        backbone.set_adapter_mode("task_train")
+
+                logits = logits[:, :self._total_classes]
+                topk_preds = torch.topk(logits, k=self.topk, dim=1, largest=True, sorted=True)[1]
+                all_preds.append(topk_preds.cpu().numpy())
+                all_labels_list.append(targets.cpu().numpy())
+
+        y_pred = np.concatenate(all_preds)
+        y_true = np.concatenate(all_labels_list)
+        result = self._evaluate(y_pred, y_true)
+
+        logging.info("[AggregatedPathKeySlotEval] total=%.2f", result["top1"])
+        for key, val in sorted(result["grouped"].items()):
+            if "-" in key:
+                logging.info("[AggregatedPathKeySlotEval] %s=%.2f", key, val)
+        return result
+
     def evaluate_path_key_slot_student(self, data_loader) -> Dict:
         """
         Task-agnostic path-level consistent routing.
-        L9 selects slot per sample via shared Q-space router_key,
-        L10/L11 follow the same slot.
+        L9 selects slot per sample, L10/L11 follow.
         """
         backbone = self._network.backbone
         backbone.eval()
 
         all_preds, all_labels_list = [], []
+        routing_records: List[Dict] = []
 
         with torch.no_grad():
             for _, inputs, targets in data_loader:
                 inputs = inputs.to(self._device)
                 logits = backbone.compute_path_key_slot_logits(inputs)
+                routing_info = backbone.collect_last_routing_info()
+                routing_records.append(routing_info)
+
                 logits = logits[:, :self._total_classes]
                 topk_preds = torch.topk(logits, k=self.topk, dim=1, largest=True, sorted=True)[1]
                 all_preds.append(topk_preds.cpu().numpy())
@@ -709,6 +824,13 @@ class GASELearner(BaseLearner):
         for key, val in sorted(result["grouped"].items()):
             if "-" in key:
                 logging.info("[PathKeySlotEval] %s=%.2f", key, val)
+
+        # Routing diagnostics for path mode
+        if routing_records and routing_records[0].get("path"):
+            from gase.diagnostics.routing_diagnostics import summarize_routing_records
+            summarize_routing_records(routing_records, torch.from_numpy(y_true),
+                                      self.args.get("increment", 10), mode="path")
+
         return result
 
     # ------------------------------------------------------------------

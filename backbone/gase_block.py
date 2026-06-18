@@ -60,6 +60,7 @@ class GASEAtlasBlock(nn.Module):
         self.oracle_slot_id: Optional[int] = None
         self.path_slot_id: Optional[Tensor] = None  # [B] for PATH_KEY_SLOT_STUDENT
         self.last_routing_info: Optional[Dict[str, Any]] = None
+        self.last_path_routing_info: Optional[Dict[str, Any]] = None
 
         routing_cfg = config.get("routing", {})
         self.use_free_adapter: bool = config.get("free_adapter", {}).get("enabled", True)
@@ -149,6 +150,7 @@ class GASEAtlasBlock(nn.Module):
                     # L9: decide the path
                     routing = self.select_slots_per_sample_by_key(h_chart, chart_id=0)
                     self.last_routing_info = routing
+                    self.last_path_routing_info = routing
                     self.path_slot_id = routing["slot_ids"]
                     delta = self.apply_chart_adapters_per_sample(h_chart, self.path_slot_id, chart_id=0)
                     x = self.add_delta_to_cls(x, delta)

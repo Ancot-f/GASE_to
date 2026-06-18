@@ -118,8 +118,15 @@ class ViTGASE(nn.Module):
         x = torch.cat((cls_tokens, x), dim=1)
         x = x + self.pos_embed
         x = self.pos_drop(x)
-        for blk in self.blocks:
+        for i, blk in enumerate(self.blocks):
             x, _routing = blk(x)
+            # Phase-7.5: PATH_KEY_SLOT_STUDENT — propagate L9 path to L10/L11
+            if (self.adapter_mode == PATH_KEY_SLOT_STUDENT and
+                i == self.atlas_layers[0] and isinstance(blk, GASEAtlasBlock)
+                and hasattr(blk, "path_slot_id") and blk.path_slot_id is not None):
+                for lid in self.atlas_layers:
+                    if lid > i:
+                        self.blocks[lid].path_slot_id = blk.path_slot_id
         x = self.norm(x)
         x = self.pre_logits(x[:, 0])
         return x
@@ -237,15 +244,7 @@ class ViTGASE(nn.Module):
         prev_mode = self.adapter_mode
         self.set_adapter_mode(PATH_KEY_SLOT_STUDENT)
         try:
-            out = self.forward(images)
-            # Propagate L9's path_slot_id to L10/L11
-            first_atlas = min(self.atlas_layers)
-            l9_blk = self.blocks[first_atlas]
-            if hasattr(l9_blk, "path_slot_id") and l9_blk.path_slot_id is not None:
-                for lid in self.atlas_layers:
-                    if lid > first_atlas:
-                        self.blocks[lid].path_slot_id = l9_blk.path_slot_id
-            return out["logits"]
+            return self.forward(images)["logits"]
         finally:
             self.set_adapter_mode(prev_mode)
 
@@ -254,14 +253,18 @@ class ViTGASE(nn.Module):
             if isinstance(blk, GASEAtlasBlock):
                 blk.path_slot_id = None
 
-    def collect_last_routing_info(self) -> Dict[int, any]:
-        """Collect last_routing_info from each atlas layer after forward."""
-        info = {}
+    def collect_last_routing_info(self):
+        """Return {per_layer: {lid: info}, path: info_or_none} after forward."""
+        per_layer = {}
+        path_info = None
         for lid in self.atlas_layers:
             blk = self.blocks[lid]
             if hasattr(blk, "last_routing_info") and blk.last_routing_info is not None:
-                info[lid] = blk.last_routing_info
-        return info
+                per_layer[lid] = blk.last_routing_info
+            if (hasattr(blk, "last_path_routing_info") and
+                blk.last_path_routing_info is not None):
+                path_info = blk.last_path_routing_info
+        return {"per_layer": per_layer, "path": path_info}
 
     def compute_student_logits(self, images: Tensor) -> Tensor:
         prev_mode = self.adapter_mode

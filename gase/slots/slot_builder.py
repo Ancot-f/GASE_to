@@ -109,10 +109,14 @@ class SlotBuilder:
         logging.info(
             "[SlotContract] layer=%d chart=%d slot=%d "
             "definition=residual_field_mode method=cross_covariance_svd "
-            "P_shape=%s R_shape=%s key_norm=%.4f b_norm=%.4f support=%d",
+            "P_shape=%s R_shape=%s "
+            "adapter_basis=P_cross_cov router_basis=shared_Q "
+            "adapter_key_norm=%.4f router_key_norm=%.4f router_var_mean=%.4f "
+            "b_norm=%.4f support=%d",
             chart_state.layer_id, chart_state.chart_id, slot_id,
             list(P.shape), list(R.shape),
-            float(key.norm()), float(b.norm()), h_chart.shape[0],
+            float(key.norm()), float(router_key.norm()), float(router_var.mean()),
+            float(b.norm()), h_chart.shape[0],
         )
         return slot_state
 
