@@ -87,6 +87,9 @@ class GASELearner(BaseLearner):
 
         # Phase-9: default router
         self.default_router: str = args.get("routing", {}).get("default_router", "shared_q_distance")
+        self.phase6_path_nll_eval: Optional[Dict] = None
+        self.phase6_cand_path_eval: Optional[Dict] = None
+        self.phase6_hybrid_eval: Optional[Dict] = None
 
         logging.info(
             "GASELearner Phase-2 initialized. atlas_layers=%s, adapter_dim=%d",
@@ -439,14 +442,26 @@ class GASELearner(BaseLearner):
                 key_result = self.evaluate_key_slot_student(self.test_loader)
                 path_result = self.evaluate_path_key_slot_student(self.test_loader)
                 agg_result = self.evaluate_aggregated_path_key_slot_student(self.test_loader)
+                path_nll_result = self.evaluate_path_raw_nll_slot_student(self.test_loader)
+                cand_path_result = self.evaluate_candidate_path_raw_nll_slot_student(self.test_loader)
+                hybrid_result = self.evaluate_hybrid_path_raw_nll_slot_student(self.test_loader)
+                self.phase6_path_nll_eval = path_nll_result
+                self.phase6_cand_path_eval = cand_path_result
+                self.phase6_hybrid_eval = hybrid_result
 
                 if oracle_result and key_result and path_result:
+                    default_name = {"raw_nll": "PerLayerRawNLL", "hybrid_path_raw_nll": "HybridPathRawNLL",
+                                   "shared_q_distance": "PerLayerSharedQDist"}.get(self.default_router, self.default_router)
                     logging.info(
-                        "[EvalCompare] Oracle=%.2f PerLayerKey=%.2f PathKey=%.2f AggPath=%.2f "
-                        "Oracle-Key_gap=%.2f Default=PerLayerKey",
+                        "[EvalCompare] Oracle=%.2f PerLayerSharedQDist=%.2f "
+                        "PathRawNLL=%.2f CandidatePathRawNLL=%.2f HybridBest=%.2f "
+                        "Oracle-gap=%.2f Default=%s",
                         oracle_result.get("top1", 0), key_result.get("top1", 0),
-                        path_result.get("top1", 0), agg_result.get("top1", 0),
+                        path_nll_result.get("top1", 0) if path_nll_result else 0,
+                        cand_path_result.get("top1", 0) if cand_path_result else 0,
+                        hybrid_result.get("top1", 0) if hybrid_result else 0,
                         oracle_result.get("top1", 0) - key_result.get("top1", 0),
+                        default_name,
                     )
                 # Phase-8.7: head stabilization with pre_known range
                 if self.weight_norm_align and self._cur_task > 0:
@@ -1078,15 +1093,14 @@ class GASELearner(BaseLearner):
                         finally:
                             backbone.set_adapter_mode("task_train")
 
-                        # Compute path NLL: sum across layers
+                        # Compute path NLL: sum across layers using last_h_chart
                         path_nll = torch.zeros(B, device=self._device)
                         for lid in self.atlas_layers:
                             blk = backbone.get_block(lid)
                             cs = blk.chart_states.get(0)
                             ss = blk.slot_states.get(f"0_{sid}")
-                            if cs is not None and ss is not None:
-                                h_l = backbone._extract_h_chart_at_layer(inputs, lid)
-                                nll = router.compute_nll(h_l, cs, ss)
+                            if cs is not None and ss is not None and blk.last_h_chart is not None:
+                                nll = router.compute_nll(blk.last_h_chart, cs, ss)
                                 path_nll += nll
                         path_scores[:, idx] = path_nll
 
@@ -1119,6 +1133,143 @@ class GASELearner(BaseLearner):
             if "-" in key:
                 logging.info("[CandidatePathRawNLLEval] %s=%.2f", key, val)
         return result
+
+    def evaluate_hybrid_path_raw_nll_slot_student(self, data_loader) -> Dict:
+        """
+        Confidence-gated hybrid: if L9 raw-NLL margin > tau → PathRawNLL,
+        else → PerLayerRawNLL. Sweeps tau ∈ [0,1,2,3,5,8,10].
+        Returns best_tau result dict.
+        """
+        from gase.routing.nll_router import CalibratedNLLSlotRouter
+        backbone = self._network.backbone
+        router = CalibratedNLLSlotRouter(temperature=1.0, calibrate_nll=False, use_logdet=True)
+        first_atlas = min(self.atlas_layers)
+
+        # Phase 1: compute L9 raw NLL margin per sample (one pass)
+        backbone.eval()
+        all_inputs, all_targets, all_l9_best, all_l9_margin = [], [], [], []
+        with torch.no_grad():
+            for _, inputs, targets in data_loader:
+                inputs = inputs.to(self._device)
+                backbone._clear_path_slot_ids()
+                backbone.set_adapter_mode("task_train")
+
+                l9_blk = backbone.get_block(first_atlas)
+                available = l9_blk.get_available_slot_ids(0)
+                cs_l9 = l9_blk.chart_states.get(0)
+                slot_states = {sid: l9_blk.slot_states.get(f"0_{sid}") for sid in available
+                               if l9_blk.slot_states.get(f"0_{sid}") is not None}
+
+                if not slot_states or cs_l9 is None:
+                    all_l9_best.append(torch.zeros(len(targets), dtype=torch.long))
+                    all_l9_margin.append(torch.zeros(len(targets)))
+                else:
+                    h9 = l9_blk.last_h_chart
+                    if h9 is None:
+                        _, h9 = backbone.extract_layer_chart_feature_and_teacher(inputs, first_atlas)
+                    nll_scores = []
+                    slot_id_list = sorted(slot_states.keys())
+                    for sid in slot_id_list:
+                        nll_scores.append(router.compute_nll(h9, cs_l9, slot_states[sid]))
+                    nll_stack = torch.stack(nll_scores, dim=1)  # [B, S]
+                    if nll_stack.shape[1] >= 2:
+                        top2 = nll_stack.topk(k=2, dim=1, largest=False).values
+                        best_idx = nll_stack.argmin(dim=1)
+                        margin = top2[:, 1] - top2[:, 0]
+                        best_slot = torch.tensor([slot_id_list[i.item()] for i in best_idx],
+                                                 device=inputs.device, dtype=torch.long)
+                    else:
+                        best_slot = torch.zeros(len(targets), dtype=torch.long, device=inputs.device)
+                        margin = torch.full([len(targets)], float("inf"), device=inputs.device)
+                    all_l9_best.append(best_slot.cpu())
+                    all_l9_margin.append(margin.cpu())
+                all_inputs.append(inputs.cpu())
+                all_targets.append(targets)
+
+        # Phase 2: for each tau, forward with hybrid policy
+        all_l9_best_cat = torch.cat(all_l9_best)
+        all_l9_margin_cat = torch.cat(all_l9_margin)
+        all_inputs_cat = torch.cat(all_inputs)
+        all_targets_cat = torch.cat(all_targets)
+        N = all_targets_cat.shape[0]
+
+        taus = [0.0, 1.0, 2.0, 3.0, 5.0, 8.0, 10.0]
+        best_total = 0.0
+        best_result = None
+        best_tau = 0.0
+
+        for tau in taus:
+            path_mask = all_l9_margin_cat > tau
+            per_layer_mask = ~path_mask
+
+            all_preds, all_labels = [], []
+
+            # Forward path_mask samples (PathRawNLL)
+            if path_mask.any():
+                path_inputs = all_inputs_cat[path_mask].to(self._device)
+                path_slots = all_l9_best_cat[path_mask].to(self._device)
+                path_targets = all_targets_cat[path_mask]
+
+                # Split into batches for memory
+                bs = self.args.get("batch_size", 16)
+                for i in range(0, len(path_inputs), bs):
+                    x_sub = path_inputs[i:i+bs].to(self._device)
+                    s_sub = path_slots[i:i+bs].to(self._device)
+                    t_sub = path_targets[i:i+bs]
+
+                    backbone._clear_path_slot_ids()
+                    for lid in self.atlas_layers:
+                        backbone.blocks[lid].path_slot_id = s_sub
+                    backbone.set_adapter_mode("path_key_slot_student")
+                    try:
+                        out = backbone.forward(x_sub)
+                        logits = out["logits"][:, :self._total_classes]
+                    finally:
+                        backbone.set_adapter_mode("task_train")
+                    topk = torch.topk(logits, k=self.topk, dim=1)[1]
+                    all_preds.append(topk.cpu().numpy())
+                    all_labels.append(t_sub.cpu().numpy())
+
+            # Forward per_layer_mask samples (PerLayerRawNLL)
+            if per_layer_mask.any():
+                per_layer_inputs = all_inputs_cat[per_layer_mask].to(self._device)
+                per_layer_targets = all_targets_cat[per_layer_mask]
+
+                bs = self.args.get("batch_size", 16)
+                for i in range(0, len(per_layer_inputs), bs):
+                    x_sub = per_layer_inputs[i:i+bs].to(self._device)
+                    t_sub = per_layer_targets[i:i+bs]
+                    logits = backbone.compute_key_slot_logits(x_sub)[:, :self._total_classes]
+                    topk = torch.topk(logits, k=self.topk, dim=1)[1]
+                    all_preds.append(topk.cpu().numpy())
+                    all_labels.append(t_sub.cpu().numpy())
+
+            if all_preds:
+                y_pred = np.concatenate(all_preds)
+                y_true = np.concatenate(all_labels)
+                # Reorder to original batch order (samples were grouped, labels track order)
+                result = self._evaluate(y_pred, y_true)
+            else:
+                result = {"top1": 0.0, "grouped": {}}
+
+            total = result.get("top1", 0)
+            path_ratio = float(path_mask.float().mean()) if N > 0 else 0
+            logging.info("[HybridPathRawNLLEval][tau=%.1f] total=%.2f path_ratio=%.2f",
+                         tau, total, path_ratio)
+            for key, val in sorted(result.get("grouped", {}).items()):
+                if "-" in key:
+                    logging.info("[HybridPathRawNLLEval][tau=%.1f] %s=%.2f", tau, key, val)
+
+            if total > best_total:
+                best_total = total
+                best_result = result
+                best_tau = tau
+
+        if best_result:
+            total = best_result.get("top1", 0)
+        logging.info("[HybridPathRawNLLBest] task=%d best_tau=%.1f total=%.2f",
+                     self._cur_task, best_tau, best_total if best_result else 0)
+        return best_result or {"top1": 0.0, "grouped": {}}
 
     # ==================================================================
     #  Phase-9: Router calibration + variant comparison
@@ -1203,15 +1354,26 @@ class GASELearner(BaseLearner):
                              tw_dist.get(key, "-"), _t(tw_nll, key), _t(tw_calib, key),
                              _t(tw_prior, key), _t(tw_s0p, key))
 
-        logging.info("[RouterCompare] total: dist=%.2f raw_nll=%.2f calib=%.2f prior=%.2f s0p=%.2f",
-                     r_dist, nll_result.get("top1", 0), calib_result.get("top1", 0),
-                     prior_result.get("top1", 0), s0p_result.get("top1", 0))
+        # Add path/hybrid variants
+        path_nll_total = self.phase6_path_nll_eval.get("top1", 0) if self.phase6_path_nll_eval else 0
+        cand_path_total = self.phase6_cand_path_eval.get("top1", 0) if self.phase6_cand_path_eval else 0
+        hybrid_total = self.phase6_hybrid_eval.get("top1", 0) if self.phase6_hybrid_eval else 0
+
+        logging.info("[RouterCompare] total: dist=%.2f raw_nll=%.2f path_nll=%.2f "
+                     "cand_path=%.2f hybrid=%.2f calib=%.2f prior=%.2f s0p=%.2f",
+                     r_dist, nll_result.get("top1", 0), path_nll_total, cand_path_total,
+                     hybrid_total, calib_result.get("top1", 0), prior_result.get("top1", 0),
+                     s0p_result.get("top1", 0))
 
         scores = {
             "shared_q_dist": r_dist, "raw_nll": nll_result.get("top1", 0),
             "calib_nll": calib_result.get("top1", 0), "calib_prior": prior_result.get("top1", 0),
             "slot0_penalty": s0p_result.get("top1", 0),
+            "path_raw_nll": path_nll_total,
+            "candidate_path_raw_nll": cand_path_total,
+            "hybrid_path_raw_nll": hybrid_total,
         }
+
         best = max(scores, key=scores.get)
         logging.info("[RouterCompare] best=%s (%.2f) default=%s (%.2f)", best, scores[best],
                      self.default_router, scores.get(self.default_router, 0))

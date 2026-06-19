@@ -61,6 +61,7 @@ class GASEAtlasBlock(nn.Module):
         self.path_slot_id: Optional[Tensor] = None  # [B] for PATH_KEY_SLOT_STUDENT
         self.last_routing_info: Optional[Dict[str, Any]] = None
         self.last_path_routing_info: Optional[Dict[str, Any]] = None
+        self.last_h_chart: Optional[Tensor] = None  # Phase-9.3: for routing diagnostics
         self.nll_router: Optional[object] = None  # Phase-9: CalibratedNLLSlotRouter
 
         routing_cfg = config.get("routing", {})
@@ -75,6 +76,7 @@ class GASEAtlasBlock(nn.Module):
     def forward(self, x: Tensor, return_routing: bool = False) -> Tuple[Tensor, Optional[RoutingOutput]]:
         x = self.forward_original_block(x)
         h_chart = self.get_router_feature(x)
+        self.last_h_chart = h_chart.detach()  # Phase-9.3: for routing diagnostics
         routing_info = None
 
         mode = self.adapter_mode

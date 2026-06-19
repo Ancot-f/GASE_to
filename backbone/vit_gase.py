@@ -259,6 +259,23 @@ class ViTGASE(nn.Module):
             if isinstance(blk, GASEAtlasBlock):
                 blk.path_slot_id = None
 
+    def _extract_h_chart_at_layer(self, images: Tensor, layer_id: int) -> Tensor:
+        """Extract pre-adapter h_chart (CLS) at a specific layer for routing diagnostics."""
+        B = images.shape[0]
+        x = self.patch_embed(images)
+        cls_tokens = self.cls_token.expand(B, -1, -1)
+        x = torch.cat((cls_tokens, x), dim=1)
+        x = x + self.pos_embed
+        x = self.pos_drop(x)
+        for i, blk in enumerate(self.blocks):
+            if i == layer_id:
+                blk_out = blk.forward_original_block(x) if isinstance(blk, GASEAtlasBlock) else blk(x)
+                if blk_out.dim() == 3:
+                    return blk_out[:, 0]
+                return blk_out
+            x, _routing = blk(x) if isinstance(blk, GASEAtlasBlock) else (blk(x), None)
+        return torch.zeros(B, self.embed_dim, device=images.device)
+
     def collect_last_routing_info(self):
         """Return {per_layer: {lid: info}, path: info_or_none} after forward."""
         per_layer = {}
