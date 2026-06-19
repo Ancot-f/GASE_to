@@ -61,6 +61,7 @@ class GASEAtlasBlock(nn.Module):
         self.path_slot_id: Optional[Tensor] = None  # [B] for PATH_KEY_SLOT_STUDENT
         self.last_routing_info: Optional[Dict[str, Any]] = None
         self.last_path_routing_info: Optional[Dict[str, Any]] = None
+        self.nll_router: Optional[object] = None  # Phase-9: CalibratedNLLSlotRouter
 
         routing_cfg = config.get("routing", {})
         self.use_free_adapter: bool = config.get("free_adapter", {}).get("enabled", True)
@@ -130,7 +131,7 @@ class GASEAtlasBlock(nn.Module):
                 delta = self.apply_base_adapter(h_chart)
                 x = self.add_delta_to_cls(x, delta)
             elif self.is_atlas_layer:
-                routing = self.select_slots_per_sample_by_key(h_chart, chart_id=0)
+                routing = self.select_slots_per_sample_by_key(h_chart, chart_id=0, router=self.nll_router)
                 selected = routing["slot_ids"]
                 delta = self.apply_chart_adapters_per_sample(h_chart, selected, chart_id=0)
                 self.last_routing_info = routing
@@ -143,12 +144,10 @@ class GASEAtlasBlock(nn.Module):
                 x = self.add_delta_to_cls(x, delta)
             elif self.is_atlas_layer:
                 if self.path_slot_id is not None:
-                    # Follow L9-decided path
                     delta = self.apply_chart_adapters_per_sample(h_chart, self.path_slot_id, chart_id=0)
                     x = self.add_delta_to_cls(x, delta)
                 else:
-                    # L9: decide the path
-                    routing = self.select_slots_per_sample_by_key(h_chart, chart_id=0)
+                    routing = self.select_slots_per_sample_by_key(h_chart, chart_id=0, router=self.nll_router)
                     self.last_routing_info = routing
                     self.last_path_routing_info = routing
                     self.path_slot_id = routing["slot_ids"]
@@ -308,15 +307,16 @@ class GASEAtlasBlock(nn.Module):
     # ==================================================================
 
     def select_slots_per_sample_by_key(
-        self, h_chart: Tensor, chart_id: int = 0,
+        self, h_chart: Tensor, chart_id: int = 0, router=None,
     ) -> Dict[str, Any]:
-        """Select a slot for each sample independently using KeySlotRouter."""
+        """Select a slot for each sample independently. Uses KeySlotRouter by default,
+        or CalibratedNLLSlotRouter if provided."""
         cs = self.chart_states.get(chart_id)
         if cs is None or getattr(cs, "mu", None) is None:
             return {"slot_ids": torch.zeros(h_chart.shape[0], dtype=torch.long, device=h_chart.device),
                     "entropy": torch.zeros(h_chart.shape[0], device=h_chart.device),
                     "margin": torch.full([h_chart.shape[0]], float("inf"), device=h_chart.device),
-                    "slot_id_list": []}
+                    "slot_id_list": [], "scores": torch.zeros(h_chart.shape[0], 0, device=h_chart.device)}
         available = self.get_available_slot_ids(chart_id)
         slot_states: Dict[int, object] = {}
         for sid in available:
@@ -327,10 +327,12 @@ class GASEAtlasBlock(nn.Module):
             return {"slot_ids": torch.zeros(h_chart.shape[0], dtype=torch.long, device=h_chart.device),
                     "entropy": torch.zeros(h_chart.shape[0], device=h_chart.device),
                     "margin": torch.full([h_chart.shape[0]], float("inf"), device=h_chart.device),
-                    "slot_id_list": []}
+                    "slot_id_list": [], "scores": torch.zeros(h_chart.shape[0], 0, device=h_chart.device)}
+        if router is not None:
+            return router.route(h_chart, cs, slot_states)
         from gase.routing.key_router import KeySlotRouter
-        router = KeySlotRouter(temperature=1.0, use_mahalanobis=True)
-        return router.route(h_chart, cs, slot_states)
+        default_router = KeySlotRouter(temperature=1.0, use_mahalanobis=True)
+        return default_router.route(h_chart, cs, slot_states)
 
     def apply_chart_adapters_per_sample(
         self, h_chart: Tensor, selected_slot_ids: Tensor, chart_id: int = 0,

@@ -208,6 +208,12 @@ class ViTGASE(nn.Module):
             if isinstance(blk, GASEAtlasBlock):
                 blk.set_oracle_slot_id(slot_id)
 
+    def set_nll_router(self, router) -> None:
+        """Set CalibratedNLLSlotRouter on all atlas blocks."""
+        for blk in self.blocks:
+            if isinstance(blk, GASEAtlasBlock):
+                blk.nll_router = router
+
     # ------------------------------------------------------------------
     #  Compute logits helpers
     # ------------------------------------------------------------------

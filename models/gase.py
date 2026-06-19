@@ -74,17 +74,33 @@ class GASELearner(BaseLearner):
         self.bootstrap_adapter_layers: List[int] = args.get("bootstrap_adapter_layers", list(range(12)))
         self.should_stop_training: bool = False
 
+        # Phase-8.6: classifier head stabilization
+        cls_cfg = args.get("classifier", {})
+        self.head_stabilization: bool = cls_cfg.get("head_stabilization", False)
+        self.save_head_snapshots: bool = cls_cfg.get("save_head_snapshots", False)
+        self.freeze_old_classes: bool = cls_cfg.get("freeze_old_classes", False)
+        self.freeze_sigma_after_task0: bool = cls_cfg.get("freeze_sigma_after_task0", False)
+        self.weight_norm_align: bool = cls_cfg.get("weight_norm_align", False)
+        self.snapshot_eval: bool = cls_cfg.get("snapshot_eval", False)
+        self.head_snapshots: Dict[int, Dict] = {}
+        self.head_diag_enabled: bool = cls_cfg.get("diagnostics", False)
+
+        # Phase-9: default router
+        self.default_router: str = args.get("routing", {}).get("default_router", "shared_q_distance")
+
         logging.info(
             "GASELearner Phase-2 initialized. atlas_layers=%s, adapter_dim=%d",
             self.atlas_layers, self.adapter_dim,
         )
         routing_cfg = args.get("routing", {})
-        logging.info("[RoutingConfig] slot_router=%s", routing_cfg.get("slot_router", "shared_q_mahalanobis"))
-        logging.info("[RoutingConfig] use_shared_router_basis=%s", routing_cfg.get("use_shared_router_basis", True))
-        logging.info("[RoutingConfig] per_sample=%s", routing_cfg.get("per_sample", True))
-        logging.info("[RoutingConfig] path_consistent=%s", routing_cfg.get("path_consistent", True))
-        logging.info("[RoutingConfig] path_decider_layer=%d", routing_cfg.get("path_decider_layer", 9))
-        logging.info("[RoutingConfig] diagnostics=%s", routing_cfg.get("diagnostics", True))
+        actual_router = routing_cfg.get("default_router", routing_cfg.get("slot_router", "shared_q_mahalanobis"))
+        logging.info("[RouterConfig] default_router=%s", actual_router)
+        logging.info("[RouterConfig] use_shared_router_basis=%s", routing_cfg.get("use_shared_router_basis", True))
+        logging.info("[RouterConfig] per_sample=%s", routing_cfg.get("per_sample", True))
+        logging.info("[RouterConfig] use_logdet=%s", routing_cfg.get("use_logdet", True))
+        logging.info("[RouterConfig] calibrate_nll=%s", routing_cfg.get("calibrate_nll", False))
+        logging.info("[RouterConfig] compare_router_variants=%s", routing_cfg.get("compare_router_variants", True))
+        logging.info("[RouterConfig] variants=%s", routing_cfg.get("router_variants", ["shared_q_dist", "raw_nll"]))
 
     # ==================================================================
     #  Incremental training entry point (called by trainer.py)
@@ -188,6 +204,15 @@ class GASELearner(BaseLearner):
                 loss = F.cross_entropy(logits, targets)
                 optimizer.zero_grad()
                 loss.backward()
+
+                # Phase-8.6: freeze old class weights gradient
+                if self.freeze_old_classes and self._cur_task > 0:
+                    head = self._network.backbone.head
+                    if hasattr(head, "weight") and head.weight.grad is not None:
+                        head.weight.grad[:self._known_classes] = 0
+                    if self.freeze_sigma_after_task0 and hasattr(head, "sigma") and head.sigma.grad is not None:
+                        head.sigma.grad = None
+
                 optimizer.step()
                 losses += loss.item()
 
@@ -362,8 +387,13 @@ class GASELearner(BaseLearner):
 
     def after_task(self):
         """Post-task cleanup."""
+        pre_known = self._known_classes
         self._known_classes = self._total_classes
-        logging.info("Task %d completed. known_classes=%d", self._cur_task, self._known_classes)
+        logging.info("Task %d completed. known_classes=%d (pre=%d)", self._cur_task, self._known_classes, pre_known)
+
+        logging.info("[HeadRange] task=%d previous_known=%d current_known=%d old_range=0-%d new_range=%d-%d",
+                     self._cur_task, pre_known, self._total_classes, pre_known - 1 if pre_known > 0 else -1,
+                     pre_known, self._total_classes - 1)
 
         # Phase-3: run L9 feature collection if configured
         if self.phase == "feature_collect" and self._cur_task == 0:
@@ -418,6 +448,23 @@ class GASELearner(BaseLearner):
                         path_result.get("top1", 0), agg_result.get("top1", 0),
                         oracle_result.get("top1", 0) - key_result.get("top1", 0),
                     )
+                # Phase-8.7: head stabilization with pre_known range
+                if self.weight_norm_align and self._cur_task > 0:
+                    self._align_new_class_weight_norms(pre_known)
+                if self.head_diag_enabled:
+                    self._log_head_diagnostics(pre_known)
+                if self.save_head_snapshots or self.snapshot_eval:
+                    self.save_head_snapshot()
+                if self.snapshot_eval and self._cur_task >= 1:
+                    for snap_id in range(self._cur_task + 1):
+                        self.evaluate_oracle_with_snapshot_head(self.test_loader, snap_id)
+                        self.evaluate_hybrid_snapshot_head(self.test_loader, snap_id)
+
+                if self.default_router == "raw_nll":
+                    from gase.routing.nll_router import CalibratedNLLSlotRouter
+                    r = CalibratedNLLSlotRouter(temperature=1.0, calibrate_nll=False, use_logdet=True)
+                    self._network.backbone.set_nll_router(r)
+                self._eval_router_variants()
                 self._save_metrics_json()
 
     # ==================================================================
@@ -535,6 +582,17 @@ class GASELearner(BaseLearner):
         logging.info(
             "[CommittedSlots] layer=%d slots=%s", layer_id, committed_slots,
         )
+
+        # Phase-9.2: CrossNLL matrix for current source slot
+        if self.args.get("routing", {}).get("cross_nll_diagnostics", False):
+            from gase.diagnostics.cross_nll_diagnostics import compute_cross_nll_matrix
+            all_slot_states = {}
+            for sid in committed_slots:
+                ss = blk.slot_states.get(f"0_{sid}")
+                if ss is not None:
+                    all_slot_states[sid] = ss
+            if all_slot_states:
+                compute_cross_nll_matrix({slot_id: h_chart}, chart_state, all_slot_states)
 
         return {"chart": chart_state.to_dict(), "slot": slot_state.to_dict(),
                 "distill": metrics}
@@ -725,6 +783,438 @@ class GASELearner(BaseLearner):
             logging.info("[MetricsJSON] saved to %s", path)
         except Exception as e:
             logging.warning("[MetricsJSON] save failed: %s", e)
+
+    # ==================================================================
+    #  Phase-8.6: Head stabilization
+    # ==================================================================
+
+    def save_head_snapshot(self) -> None:
+        """Save classifier head snapshot after current task."""
+        import copy, os
+        head = self._network.backbone.head
+        snap = {
+            "task_id": self._cur_task,
+            "known_classes": self._known_classes,
+            "weight": copy.deepcopy(head.weight.data.cpu()),
+        }
+        if hasattr(head, "sigma"):
+            snap["sigma"] = copy.deepcopy(head.sigma.data.cpu())
+        self.head_snapshots[self._cur_task] = snap
+
+        if self.save_head_snapshots:
+            d = f"logs/gase_head_snapshots/{self.args.get('prefix', 'gase')}"
+            os.makedirs(d, exist_ok=True)
+            p = f"{d}/task{self._cur_task}_head.pt"
+            torch.save(snap, p)
+            logging.info("[HeadSnapshot] saved task=%d known_classes=%d", self._cur_task, self._known_classes)
+
+    def _apply_head_snapshot(self, snap) -> Dict:
+        """Temporarily swap current head with a snapshot. Returns save dict for restore."""
+        head = self._network.backbone.head
+        save = {"weight": head.weight.data.clone(), "sigma": None}
+        if hasattr(head, "sigma"):
+            save["sigma"] = head.sigma.data.clone()
+            head.sigma.data.copy_(snap["sigma"].to(head.sigma.device))
+        head.weight.data[:snap["weight"].shape[0]].copy_(snap["weight"].to(head.weight.device))
+        return save
+
+    def _restore_head(self, save: Dict) -> None:
+        head = self._network.backbone.head
+        head.weight.data.copy_(save["weight"])
+        if save["sigma"] is not None and hasattr(head, "sigma"):
+            head.sigma.data.copy_(save["sigma"])
+
+    def evaluate_oracle_with_snapshot_head(self, data_loader, snap_task_id: int) -> Dict:
+        """Pure snapshot eval: only evaluate classes within snapshot range."""
+        if snap_task_id not in self.head_snapshots:
+            return {}
+        snap = self.head_snapshots[snap_task_id]
+        snap_known = snap["known_classes"]
+        save = self._apply_head_snapshot(snap)
+        try:
+            backbone = self._network.backbone
+            backbone.eval()
+            all_preds, all_labels = [], []
+            with torch.no_grad():
+                for _, inputs, targets in data_loader:
+                    # Only keep samples with labels < snap_known
+                    mask = targets < snap_known
+                    if not mask.any():
+                        continue
+                    inputs = inputs[mask].to(self._device)
+                    logits = self._compute_oracle_logits(inputs, targets[mask])
+                    logits = logits[:, :snap_known]
+                    topk = torch.topk(logits, k=self.topk, dim=1, largest=True, sorted=True)[1]
+                    all_preds.append(topk.cpu().numpy())
+                    all_labels.append(targets[mask].cpu().numpy())
+            y_pred = np.concatenate(all_preds) if all_preds else np.zeros((0, self.topk))
+            y_true = np.concatenate(all_labels) if all_labels else np.zeros(0)
+            if len(y_true) == 0:
+                result = {"top1": 0, "grouped": {}}
+            else:
+                orig_total = self._total_classes
+                self._total_classes = snap_known
+                result = self._evaluate(y_pred, y_true)
+                self._total_classes = orig_total
+        finally:
+            self._restore_head(save)
+
+        logging.info("[PureSnapshotHeadEval] snap=%d known=%d total=%.2f",
+                     snap_task_id, snap_known, result.get("top1", 0))
+        for key, val in sorted(result.get("grouped", {}).items()):
+            if "-" in key:
+                logging.info("[PureSnapshotHeadEval] snap=%d %s=%.2f", snap_task_id, key, val)
+        return result
+
+    def _compute_oracle_logits(self, inputs, labels):
+        """Compute logits using oracle slot path for given labels."""
+        backbone = self._network.backbone
+        increment = self.args.get("increment", 10)
+        oracle_slots = (labels // increment).cpu().numpy()
+        unique_slots = np.unique(oracle_slots)
+        batch_logits = None
+        for sid in unique_slots:
+            mask = oracle_slots == sid
+            x_sub = inputs[mask]
+            logits_sub = backbone.compute_oracle_slot_logits(x_sub, int(sid))
+            if batch_logits is None:
+                batch_logits = torch.zeros(len(labels), logits_sub.shape[1], device=logits_sub.device)
+            batch_logits[torch.tensor(mask, device=logits_sub.device)] = logits_sub
+        return batch_logits
+
+    def evaluate_hybrid_snapshot_head(self, data_loader, snap_task_id: int) -> Dict:
+        """Hybrid eval: old classes use snapshot weights, new classes use current weights."""
+        if snap_task_id not in self.head_snapshots:
+            return {}
+        snap = self.head_snapshots[snap_task_id]
+        snap_known = snap["known_classes"]
+        head = self._network.backbone.head
+
+        cur_weight = head.weight.data.clone()
+        cur_sigma = head.sigma.data.clone() if hasattr(head, "sigma") else None
+
+        # Slice snapshot weight to snap_known rows
+        head.weight.data[:snap_known] = snap["weight"][:snap_known].to(head.weight.device)
+
+        try:
+            result = self.evaluate_oracle_slot_student(data_loader)
+        finally:
+            head.weight.data.copy_(cur_weight)
+            if cur_sigma is not None and hasattr(head, "sigma"):
+                head.sigma.data.copy_(cur_sigma)
+
+        logging.info("[HybridSnapshotHeadEval] snap=%d weight=old:snap,new:current sigma=current total=%.2f",
+                     snap_task_id, result.get("top1", 0))
+        for key, val in sorted(result.get("grouped", {}).items()):
+            if "-" in key:
+                logging.info("[HybridSnapshotHeadEval] snap=%d %s=%.2f", snap_task_id, key, val)
+        return result
+
+    def _get_pre_update_known(self) -> int:
+        """Return known_classes BEFORE after_task update."""
+        return self._total_classes - self.args.get("increment", 10)
+
+    def _align_new_class_weight_norms(self, pre_known: int) -> None:
+        """Align new class weight norms to old class mean."""
+        head = self._network.backbone.head
+        old_start, old_end = 0, pre_known
+        new_start, new_end = pre_known, self._total_classes
+
+        if new_end <= new_start:
+            logging.info("[HeadNormAlign] task=%d no new classes (new=%d:%d)", self._cur_task, new_start, new_end)
+            return
+
+        old_w = head.weight[old_start:old_end]
+        new_w = head.weight[new_start:new_end]
+        if new_w.numel() == 0:
+            return
+
+        old_norm = old_w.norm(dim=1).mean()
+        new_norm_before = new_w.norm(dim=1).mean()
+        logging.info("[HeadNormAlign] task=%d old=%d:%d new=%d:%d old_norm=%.4f new_norm_before=%.4f",
+                     self._cur_task, old_start, old_end, new_start, new_end,
+                     float(old_norm), float(new_norm_before))
+
+        new_norm_per = new_w.norm(dim=1, keepdim=True).clamp_min(1e-8)
+        new_w_aligned = new_w / new_norm_per * old_norm
+        head.weight.data[new_start:new_end] = new_w_aligned
+
+        new_norm_after = head.weight[new_start:new_end].norm(dim=1).mean()
+        logging.info("[HeadNormAlign] new_norm_after=%.4f", float(new_norm_after))
+
+    def _log_head_diagnostics(self, pre_known: int) -> None:
+        """Log classifier head norm statistics."""
+        head = self._network.backbone.head
+        old_start, old_end = 0, pre_known
+        new_start, new_end = pre_known, self._total_classes
+
+        old_w = head.weight[old_start:old_end] if old_end > old_start else None
+        new_w = head.weight[new_start:new_end] if new_end > new_start else None
+
+        old_nm = float(old_w.norm(dim=1).mean()) if old_w is not None and old_w.numel() > 0 else None
+        old_ns = float(old_w.norm(dim=1).std(unbiased=False)) if old_w is not None and old_w.numel() > 1 else None
+        new_nm = float(new_w.norm(dim=1).mean()) if new_w is not None and new_w.numel() > 0 else None
+        new_ns = float(new_w.norm(dim=1).std(unbiased=False)) if new_w is not None and new_w.numel() > 1 else None
+        ratio = new_nm / (old_nm + 1e-8) if old_nm and new_nm else None
+        sigma_val = float(head.sigma.item()) if hasattr(head, "sigma") else None
+
+        logging.info("[HeadDiag] task=%d known=%d old=%d:%d new=%d:%d old_norm=%s new_norm=%s ratio=%s sigma=%s",
+                     self._cur_task, self._total_classes, old_start, old_end, new_start, new_end,
+                     f"{old_nm:.4f}±{old_ns:.4f}" if old_nm else "none",
+                     f"{new_nm:.4f}±{new_ns:.4f}" if new_nm else "none",
+                     f"{ratio:.3f}" if ratio else "none",
+                     f"{sigma_val:.4f}" if sigma_val else "none")
+
+    # ==================================================================
+    #  Phase-9.3: Path-consistent raw NLL routing
+    # ==================================================================
+
+    def evaluate_path_raw_nll_slot_student(self, data_loader) -> Dict:
+        """
+        Use raw NLL at L9 to select one slot per sample, then force
+        L9/L10/L11 all to use that same slot (path-consistent).
+        """
+        from gase.routing.nll_router import CalibratedNLLSlotRouter
+        backbone = self._network.backbone
+        backbone.eval()
+        router = CalibratedNLLSlotRouter(temperature=1.0, calibrate_nll=False, use_logdet=True)
+
+        all_preds, all_labels_list = [], []
+        first_atlas = min(self.atlas_layers)
+
+        with torch.no_grad():
+            for _, inputs, targets in data_loader:
+                inputs = inputs.to(self._device)
+                B = inputs.shape[0]
+
+                # Get L9 chart and slots for path routing
+                l9_blk = backbone.get_block(first_atlas)
+                available = l9_blk.get_available_slot_ids(0)
+                cs_l9 = l9_blk.chart_states.get(0)
+
+                if not available or cs_l9 is None:
+                    logits = backbone.compute_key_slot_logits(inputs)
+                else:
+                    # Collect slot states
+                    slot_states = {}
+                    for sid in available:
+                        ss = l9_blk.slot_states.get(f"0_{sid}")
+                        if ss is not None:
+                            slot_states[sid] = ss
+
+                    # Extract L9 h_chart for routing
+                    h9 = backbone._extract_h_chart_at_layer(inputs, first_atlas)
+
+                    # Route with raw NLL at L9
+                    routing = router.route(h9, cs_l9, slot_states)
+                    path_slot = routing["slot_ids"]  # [B]
+
+                    # Force-consistent path forward
+                    backbone._clear_path_slot_ids()
+                    for lid in self.atlas_layers:
+                        backbone.blocks[lid].path_slot_id = path_slot
+                    backbone.set_adapter_mode("path_key_slot_student")
+                    try:
+                        out = backbone.forward(inputs)
+                        logits = out["logits"]
+                    finally:
+                        backbone.set_adapter_mode("task_train")
+
+                logits = logits[:, :self._total_classes]
+                topk = torch.topk(logits, k=self.topk, dim=1, largest=True, sorted=True)[1]
+                all_preds.append(topk.cpu().numpy())
+                all_labels_list.append(targets.cpu().numpy())
+
+        y_pred = np.concatenate(all_preds)
+        y_true = np.concatenate(all_labels_list)
+        result = self._evaluate(y_pred, y_true)
+
+        logging.info("[PathRawNLLEval] total=%.2f", result["top1"])
+        for key, val in sorted(result.get("grouped", {}).items()):
+            if "-" in key:
+                logging.info("[PathRawNLLEval] %s=%.2f", key, val)
+        return result
+
+    def evaluate_candidate_path_raw_nll_slot_student(self, data_loader) -> Dict:
+        """
+        For each candidate slot, force consistent path and sum raw NLL
+        across L9/L10/L11. Pick slot with lowest total path NLL.
+        This is a slow diagnostic, not the default inference.
+        """
+        from gase.routing.nll_router import CalibratedNLLSlotRouter
+        backbone = self._network.backbone
+        backbone.eval()
+        router = CalibratedNLLSlotRouter(temperature=1.0, calibrate_nll=False, use_logdet=True)
+
+        all_preds, all_labels_list = [], []
+
+        with torch.no_grad():
+            for _, inputs, targets in data_loader:
+                inputs = inputs.to(self._device)
+                B = inputs.shape[0]
+
+                # Determine available slots (common across atlas layers)
+                available = None
+                for lid in self.atlas_layers:
+                    blk = backbone.get_block(lid)
+                    s = set(blk.get_available_slot_ids(0))
+                    available = s if available is None else available & s
+                available = sorted(available) if available else []
+
+                if len(available) <= 1:
+                    logits = backbone.compute_key_slot_logits(inputs)
+                else:
+                    path_scores = torch.full([B, len(available)], float("inf"), device=self._device)
+
+                    for idx, sid in enumerate(available):
+                        # Force consistent path with slot sid
+                        backbone._clear_path_slot_ids()
+                        for lid in self.atlas_layers:
+                            backbone.blocks[lid].path_slot_id = torch.full(
+                                [B], sid, device=self._device, dtype=torch.long)
+                        backbone.set_adapter_mode("path_key_slot_student")
+                        try:
+                            out = backbone.forward(inputs)
+                        finally:
+                            backbone.set_adapter_mode("task_train")
+
+                        # Compute path NLL: sum across layers
+                        path_nll = torch.zeros(B, device=self._device)
+                        for lid in self.atlas_layers:
+                            blk = backbone.get_block(lid)
+                            cs = blk.chart_states.get(0)
+                            ss = blk.slot_states.get(f"0_{sid}")
+                            if cs is not None and ss is not None:
+                                h_l = backbone._extract_h_chart_at_layer(inputs, lid)
+                                nll = router.compute_nll(h_l, cs, ss)
+                                path_nll += nll
+                        path_scores[:, idx] = path_nll
+
+                    best_idx = path_scores.argmin(dim=1)
+                    best_slot = torch.tensor([available[i.item()] for i in best_idx],
+                                             device=self._device, dtype=torch.long)
+
+                    # Final forward with chosen path
+                    backbone._clear_path_slot_ids()
+                    for lid in self.atlas_layers:
+                        backbone.blocks[lid].path_slot_id = best_slot
+                    backbone.set_adapter_mode("path_key_slot_student")
+                    try:
+                        out = backbone.forward(inputs)
+                        logits = out["logits"]
+                    finally:
+                        backbone.set_adapter_mode("task_train")
+
+                logits = logits[:, :self._total_classes]
+                topk = torch.topk(logits, k=self.topk, dim=1, largest=True, sorted=True)[1]
+                all_preds.append(topk.cpu().numpy())
+                all_labels_list.append(targets.cpu().numpy())
+
+        y_pred = np.concatenate(all_preds)
+        y_true = np.concatenate(all_labels_list)
+        result = self._evaluate(y_pred, y_true)
+
+        logging.info("[CandidatePathRawNLLEval] total=%.2f", result["top1"])
+        for key, val in sorted(result.get("grouped", {}).items()):
+            if "-" in key:
+                logging.info("[CandidatePathRawNLLEval] %s=%.2f", key, val)
+        return result
+
+    # ==================================================================
+    #  Phase-9: Router calibration + variant comparison
+    # ==================================================================
+
+    def _eval_with_router(self, data_loader, router_name: str, router) -> Dict:
+        """Evaluate PerLayerKey with a specific router, using custom log prefix."""
+        backbone = self._network.backbone
+        backbone.set_nll_router(router)
+
+        # Override log prefix by patching evaluate_key_slot_student
+        # We do a manual eval to get correct naming
+        backbone.eval()
+        all_preds, all_labels_list = [], []
+        with torch.no_grad():
+            for _, inputs, targets in data_loader:
+                inputs = inputs.to(self._device)
+                logits = backbone.compute_key_slot_logits(inputs)
+                logits = logits[:, :self._total_classes]
+                topk = torch.topk(logits, k=self.topk, dim=1, largest=True, sorted=True)[1]
+                all_preds.append(topk.cpu().numpy())
+                all_labels_list.append(targets.cpu().numpy())
+        y_pred = np.concatenate(all_preds)
+        y_true = np.concatenate(all_labels_list)
+        result = self._evaluate(y_pred, y_true)
+
+        name_map = {
+            "shared_q_dist": "PerLayerSharedQDistEval",
+            "raw_nll": "PerLayerRawNLLEval",
+            "calibrated_nll": "PerLayerCalibNLLEval",
+            "calib_nll_prior": "PerLayerCalibPriorEval",
+            "calib_nll_s0penalty": "PerLayerSlot0PenaltyEval",
+        }
+        tag = name_map.get(router_name, router_name)
+        logging.info("[%s] total=%.2f", tag, result["top1"])
+        for key, val in sorted(result.get("grouped", {}).items()):
+            if "-" in key:
+                logging.info("[%s] %s=%.2f", tag, key, val)
+
+        backbone.set_nll_router(None)
+        return result
+
+    def _eval_router_variants(self) -> None:
+        """Compare multiple router variants with taskwise breakdown."""
+        from gase.routing.nll_router import CalibratedNLLSlotRouter
+        logging.info("[RouterCompare] task=%d", self._cur_task)
+
+        # Baseline: shared-Q distance (already computed by evaluate_key_slot_student)
+        r_dist = self.phase6_key_eval.get("top1", 0) if self.phase6_key_eval else 0
+        r_dist_old = self.phase6_key_eval.get("grouped", {}).get("00-09", 0) if self.phase6_key_eval else 0
+
+        # Raw NLL (no calibration)
+        r_nll = CalibratedNLLSlotRouter(temperature=1.0, calibrate_nll=False, use_logdet=True)
+        nll_result = self._eval_with_router(self.test_loader, "raw_nll", r_nll)
+
+        # Calibrated NLL
+        r_calib = CalibratedNLLSlotRouter(temperature=1.0, calibrate_nll=True, use_logdet=True)
+        calib_result = self._eval_with_router(self.test_loader, "calibrated_nll", r_calib)
+
+        # Calibrated NLL + prior
+        r_prior = CalibratedNLLSlotRouter(temperature=1.0, calibrate_nll=True, use_logdet=True,
+                                           prior_mode="uniform", prior_weight=0.5)
+        prior_result = self._eval_with_router(self.test_loader, "calib_nll_prior", r_prior)
+
+        # slot0 penalty
+        r_s0p = CalibratedNLLSlotRouter(temperature=1.0, calibrate_nll=True, use_logdet=True,
+                                         slot0_penalty=1.0)
+        s0p_result = self._eval_with_router(self.test_loader, "calib_nll_s0penalty", r_s0p)
+
+        def _t(taskwise, key):
+            return taskwise.get(key, 0) if taskwise else 0
+
+        tw_dist = self.phase6_key_eval.get("grouped", {}) if self.phase6_key_eval else {}
+        tw_nll = nll_result.get("grouped", {}) if nll_result else {}
+        tw_calib = calib_result.get("grouped", {}) if calib_result else {}
+        tw_prior = prior_result.get("grouped", {}) if prior_result else {}
+        tw_s0p = s0p_result.get("grouped", {}) if s0p_result else {}
+
+        for key in sorted(tw_dist):
+            if "-" in key:
+                logging.info("[RouterCompare] %s: dist=%s raw_nll=%s calib=%s prior=%s s0p=%s", key,
+                             tw_dist.get(key, "-"), _t(tw_nll, key), _t(tw_calib, key),
+                             _t(tw_prior, key), _t(tw_s0p, key))
+
+        logging.info("[RouterCompare] total: dist=%.2f raw_nll=%.2f calib=%.2f prior=%.2f s0p=%.2f",
+                     r_dist, nll_result.get("top1", 0), calib_result.get("top1", 0),
+                     prior_result.get("top1", 0), s0p_result.get("top1", 0))
+
+        scores = {
+            "shared_q_dist": r_dist, "raw_nll": nll_result.get("top1", 0),
+            "calib_nll": calib_result.get("top1", 0), "calib_prior": prior_result.get("top1", 0),
+            "slot0_penalty": s0p_result.get("top1", 0),
+        }
+        best = max(scores, key=scores.get)
+        logging.info("[RouterCompare] best=%s (%.2f) default=%s (%.2f)", best, scores[best],
+                     self.default_router, scores.get(self.default_router, 0))
 
     def evaluate_aggregated_path_key_slot_student(self, data_loader) -> Dict:
         """
