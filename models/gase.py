@@ -1135,146 +1135,87 @@ class GASELearner(BaseLearner):
         return result
 
     def evaluate_hybrid_path_raw_nll_slot_student(self, data_loader) -> Dict:
-        """
-        Confidence-gated hybrid: if L9 raw-NLL margin > tau → PathRawNLL,
-        else → PerLayerRawNLL. Sweeps tau ∈ [0,1,2,3,5,8,10].
-        Returns best_tau result dict.
-        """
+        """Confidence-gated hybrid: L9 NLL margin > tau => Path, else PerLayer."""
         from gase.routing.nll_router import CalibratedNLLSlotRouter
         backbone = self._network.backbone
         router = CalibratedNLLSlotRouter(temperature=1.0, calibrate_nll=False, use_logdet=True)
         first_atlas = min(self.atlas_layers)
-
-        # Phase 1: compute L9 raw NLL margin per sample (one pass)
+        taus = [0.0, 1.0, 2.0, 3.0, 5.0, 8.0, 10.0]
         backbone.eval()
-        all_inputs, all_targets, all_l9_best, all_l9_margin = [], [], [], []
+        all_best, all_margin = [], []
         with torch.no_grad():
-            for _, inputs, targets in data_loader:
-                inputs = inputs.to(self._device)
-                backbone._clear_path_slot_ids()
-                backbone.set_adapter_mode("task_train")
-
+            for _, inputs_in, targets in data_loader:
+                inputs_in = inputs_in.to(self._device)
+                B = inputs_in.shape[0]
                 l9_blk = backbone.get_block(first_atlas)
                 available = l9_blk.get_available_slot_ids(0)
                 cs_l9 = l9_blk.chart_states.get(0)
-                slot_states = {sid: l9_blk.slot_states.get(f"0_{sid}") for sid in available
-                               if l9_blk.slot_states.get(f"0_{sid}") is not None}
-
-                if not slot_states or cs_l9 is None:
-                    all_l9_best.append(torch.zeros(len(targets), dtype=torch.long))
-                    all_l9_margin.append(torch.zeros(len(targets)))
-                else:
-                    h9 = l9_blk.last_h_chart
-                    if h9 is None:
-                        _, h9 = backbone.extract_layer_chart_feature_and_teacher(inputs, first_atlas)
-                    nll_scores = []
-                    slot_id_list = sorted(slot_states.keys())
-                    for sid in slot_id_list:
-                        nll_scores.append(router.compute_nll(h9, cs_l9, slot_states[sid]))
-                    nll_stack = torch.stack(nll_scores, dim=1)  # [B, S]
-                    if nll_stack.shape[1] >= 2:
-                        top2 = nll_stack.topk(k=2, dim=1, largest=False).values
-                        best_idx = nll_stack.argmin(dim=1)
-                        margin = top2[:, 1] - top2[:, 0]
-                        best_slot = torch.tensor([slot_id_list[i.item()] for i in best_idx],
-                                                 device=inputs.device, dtype=torch.long)
-                    else:
-                        best_slot = torch.zeros(len(targets), dtype=torch.long, device=inputs.device)
-                        margin = torch.full([len(targets)], float("inf"), device=inputs.device)
-                    all_l9_best.append(best_slot.cpu())
-                    all_l9_margin.append(margin.cpu())
-                all_inputs.append(inputs.cpu())
-                all_targets.append(targets)
-
-        # Phase 2: for each tau, forward with hybrid policy
-        all_l9_best_cat = torch.cat(all_l9_best)
-        all_l9_margin_cat = torch.cat(all_l9_margin)
-        all_inputs_cat = torch.cat(all_inputs)
-        all_targets_cat = torch.cat(all_targets)
-        N = all_targets_cat.shape[0]
-
-        taus = [0.0, 1.0, 2.0, 3.0, 5.0, 8.0, 10.0]
-        best_total = 0.0
-        best_result = None
-        best_tau = 0.0
-
+                slot_states = {}
+                for sid in available:
+                    ss = l9_blk.slot_states.get(f"0_{sid}")
+                    if ss is not None:
+                        slot_states[sid] = ss
+                if len(slot_states) < 2 or cs_l9 is None:
+                    all_best.append(torch.zeros(B, dtype=torch.long))
+                    all_margin.append(torch.zeros(B))
+                    continue
+                _, h9 = backbone.extract_layer_chart_feature_and_teacher(inputs_in, first_atlas)
+                nll_list, sid_list = [], sorted(slot_states.keys())
+                for sid in sid_list:
+                    nll_list.append(router.compute_nll(h9, cs_l9, slot_states[sid]))
+                nll_stack = torch.stack(nll_list, dim=1)
+                top2 = nll_stack.topk(k=2, dim=1, largest=False).values
+                best_idx = nll_stack.argmin(dim=1)
+                margin = top2[:, 1] - top2[:, 0]
+                best_slot = torch.tensor([sid_list[i.item()] for i in best_idx], dtype=torch.long)
+                all_best.append(best_slot)
+                all_margin.append(margin)
+        best_result, best_total, best_tau = None, 0.0, 0.0
         for tau in taus:
-            path_mask = all_l9_margin_cat > tau
-            per_layer_mask = ~path_mask
-
             all_preds, all_labels = [], []
-
-            # Forward path_mask samples (PathRawNLL)
-            if path_mask.any():
-                path_inputs = all_inputs_cat[path_mask].to(self._device)
-                path_slots = all_l9_best_cat[path_mask].to(self._device)
-                path_targets = all_targets_cat[path_mask]
-
-                # Split into batches for memory
-                bs = self.args.get("batch_size", 16)
-                for i in range(0, len(path_inputs), bs):
-                    x_sub = path_inputs[i:i+bs].to(self._device)
-                    s_sub = path_slots[i:i+bs].to(self._device)
-                    t_sub = path_targets[i:i+bs]
-
+            bi = 0
+            for _, inputs_in, targets_in in data_loader:
+                inputs_in = inputs_in.to(self._device)
+                B = inputs_in.shape[0]
+                if bi >= len(all_best):
+                    continue
+                batch_best = all_best[bi].to(self._device)
+                batch_margin = all_margin[bi].to(self._device)
+                bi += 1
+                path_mask = batch_margin > tau
+                per_layer_mask = ~path_mask
+                batch_logits = torch.zeros(B, self._total_classes, device=self._device)
+                if path_mask.any():
                     backbone._clear_path_slot_ids()
                     for lid in self.atlas_layers:
-                        backbone.blocks[lid].path_slot_id = s_sub
+                        backbone.blocks[lid].path_slot_id = batch_best[path_mask]
                     backbone.set_adapter_mode("path_key_slot_student")
                     try:
-                        out = backbone.forward(x_sub)
-                        logits = out["logits"][:, :self._total_classes]
+                        batch_logits[path_mask] = backbone.forward(inputs_in[path_mask])["logits"][:, :self._total_classes]
                     finally:
                         backbone.set_adapter_mode("task_train")
-                    topk = torch.topk(logits, k=self.topk, dim=1)[1]
-                    all_preds.append(topk.cpu().numpy())
-                    all_labels.append(t_sub.cpu().numpy())
-
-            # Forward per_layer_mask samples (PerLayerRawNLL)
-            if per_layer_mask.any():
-                per_layer_inputs = all_inputs_cat[per_layer_mask].to(self._device)
-                per_layer_targets = all_targets_cat[per_layer_mask]
-
-                bs = self.args.get("batch_size", 16)
-                for i in range(0, len(per_layer_inputs), bs):
-                    x_sub = per_layer_inputs[i:i+bs].to(self._device)
-                    t_sub = per_layer_targets[i:i+bs]
-                    logits = backbone.compute_key_slot_logits(x_sub)[:, :self._total_classes]
-                    topk = torch.topk(logits, k=self.topk, dim=1)[1]
-                    all_preds.append(topk.cpu().numpy())
-                    all_labels.append(t_sub.cpu().numpy())
-
+                if per_layer_mask.any():
+                    batch_logits[per_layer_mask] = backbone.compute_key_slot_logits(inputs_in[per_layer_mask])[:, :self._total_classes]
+                topk = torch.topk(batch_logits, k=self.topk, dim=1, largest=True, sorted=True)[1]
+                all_preds.append(topk.cpu().numpy())
+                all_labels.append(targets_in.cpu().numpy())
             if all_preds:
                 y_pred = np.concatenate(all_preds)
                 y_true = np.concatenate(all_labels)
-                # Reorder to original batch order (samples were grouped, labels track order)
                 result = self._evaluate(y_pred, y_true)
             else:
                 result = {"top1": 0.0, "grouped": {}}
-
             total = result.get("top1", 0)
-            path_ratio = float(path_mask.float().mean()) if N > 0 else 0
-            logging.info("[HybridPathRawNLLEval][tau=%.1f] total=%.2f path_ratio=%.2f",
-                         tau, total, path_ratio)
+            path_ratio = float(torch.cat(all_margin).gt(tau).float().mean()) if all_margin else 0
+            logging.info("[HybridPathRawNLLEval][tau=%.1f] total=%.2f path_ratio=%.2f", tau, total, path_ratio)
             for key, val in sorted(result.get("grouped", {}).items()):
                 if "-" in key:
                     logging.info("[HybridPathRawNLLEval][tau=%.1f] %s=%.2f", tau, key, val)
-
             if total > best_total:
-                best_total = total
-                best_result = result
-                best_tau = tau
-
-        if best_result:
-            total = best_result.get("top1", 0)
+                best_total, best_result, best_tau = total, result, tau
         logging.info("[HybridPathRawNLLBest] task=%d best_tau=%.1f total=%.2f",
-                     self._cur_task, best_tau, best_total if best_result else 0)
+                     self._cur_task, best_tau, best_total)
         return best_result or {"top1": 0.0, "grouped": {}}
-
-    # ==================================================================
-    #  Phase-9: Router calibration + variant comparison
-    # ==================================================================
-
     def _eval_with_router(self, data_loader, router_name: str, router) -> Dict:
         """Evaluate PerLayerKey with a specific router, using custom log prefix."""
         backbone = self._network.backbone
