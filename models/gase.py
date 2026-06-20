@@ -91,6 +91,25 @@ class GASELearner(BaseLearner):
         self.phase6_cand_path_eval: Optional[Dict] = None
         self.phase6_hybrid_eval: Optional[Dict] = None
 
+        # Phase-9.6: path gate config
+        self.path_gate_eval: bool = args.get("routing", {}).get("path_gate_eval", False)
+        pg_cfg = args.get("routing", {}).get("path_gate", {})
+        self.path_gate_tau_list: List[float] = pg_cfg.get("tau_margin_list", [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 5.0])
+        self.path_gate_agreement_list: List[int] = pg_cfg.get("agreement_min_list", [1, 2, 3])
+        self.path_gate_gate_types: List[str] = pg_cfg.get("gate_types", ["candidate_margin", "layer_agreement", "candidate_agreement"])
+        self.phase96_cand_margin_eval: Optional[Dict] = None
+        self.phase96_layer_agreement_eval: Optional[Dict] = None
+        self.phase96_cand_agreement_eval: Optional[Dict] = None
+
+        # Phase-9.7: path score variant config
+        self.path_score_eval: bool = args.get("routing", {}).get("path_score_eval", False)
+        ps_cfg = args.get("routing", {}).get("path_score", {})
+        self.balanced_z_gamma_list: List[float] = ps_cfg.get("balanced_z_gamma0_list", [0.0, 0.5, 1.0, 2.0, 3.0, 5.0, 8.0])
+        self.percentile_s0p_gamma_list: List[float] = ps_cfg.get("percentile_s0p_gamma0_list", [0.0, 0.05, 0.10, 0.20, 0.30, 0.50, 1.00])
+        self.phase97_balanced_z_eval: Optional[Dict] = None
+        self.phase97_percentile_eval: Optional[Dict] = None
+        self.phase97_percentile_s0p_eval: Optional[Dict] = None
+
         logging.info(
             "GASELearner Phase-2 initialized. atlas_layers=%s, adapter_dim=%d",
             self.atlas_layers, self.adapter_dim,
@@ -449,16 +468,78 @@ class GASELearner(BaseLearner):
                 self.phase6_cand_path_eval = cand_path_result
                 self.phase6_hybrid_eval = hybrid_result
 
+                # Phase-9.6: path gate evals
+                cand_margin_best = None
+                layer_agreement_best = None
+                cand_agreement_best = None
+                if self.path_gate_eval:
+                    logging.info("[PathGate] Phase-9.6: running path gate evaluations...")
+                    if "candidate_margin" in self.path_gate_gate_types:
+                        cm = self._run_candidate_margin_sweep(
+                            self.test_loader, self.path_gate_tau_list)
+                        self.phase96_cand_margin_eval = cm
+                        cand_margin_best = cm.get("best_result", {})
+                    if "layer_agreement" in self.path_gate_gate_types:
+                        la = self._run_layer_agreement_sweep(
+                            self.test_loader, self.path_gate_agreement_list)
+                        self.phase96_layer_agreement_eval = la
+                        layer_agreement_best = la.get("best_result", {})
+                    if "candidate_agreement" in self.path_gate_gate_types:
+                        ca = self._run_candidate_agreement_sweep(
+                            self.test_loader, self.path_gate_tau_list,
+                            self.path_gate_agreement_list)
+                        self.phase96_cand_agreement_eval = ca
+                        cand_agreement_best = ca.get("best_result", {})
+                    # Diagnostics
+                    self._log_path_gate_diagnostics(self.test_loader)
+
+                # Phase-9.7: path score variants
+                balanced_z_best = None
+                percentile_result = None
+                percentile_s0p_best = None
+                if self.path_score_eval:
+                    logging.info("[PathScore] Phase-9.7: running path score variants...")
+                    self._log_slot_bias_diagnostics()
+                    # Balanced z-score sweep
+                    bz = self._run_balanced_z_sweep(self.test_loader, self.balanced_z_gamma_list)
+                    self.phase97_balanced_z_eval = bz
+                    balanced_z_best = bz.get("best_result", {})
+                    # Percentile path
+                    percentile_result = self.evaluate_path_score_variant_slot_student(
+                        self.test_loader, score_type="percentile")
+                    self.phase97_percentile_eval = percentile_result
+                    # Percentile + slot0 penalty sweep
+                    ps0p = self._run_percentile_s0p_sweep(
+                        self.test_loader, self.percentile_s0p_gamma_list)
+                    self.phase97_percentile_s0p_eval = ps0p
+                    percentile_s0p_best = ps0p.get("best_result", {})
+
                 if oracle_result and key_result and path_result:
+                    # Compute PerLayerRawNLL (not available from key_result which uses shared-Q)
+                    from gase.routing.nll_router import CalibratedNLLSlotRouter
+                    r_nll = CalibratedNLLSlotRouter(temperature=1.0, calibrate_nll=False, use_logdet=True)
+                    raw_nll_result = self._eval_with_router(self.test_loader, "raw_nll", r_nll)
+                    raw_nll_total = raw_nll_result.get("top1", 0) if raw_nll_result else 0
+
+                    cm_total = cand_margin_best.get("top1", 0) if cand_margin_best else 0
+                    la_total = layer_agreement_best.get("top1", 0) if layer_agreement_best else 0
+                    ca_total = cand_agreement_best.get("top1", 0) if cand_agreement_best else 0
+                    bz_total = balanced_z_best.get("top1", 0) if balanced_z_best else 0
+                    perc_total = percentile_result.get("top1", 0) if percentile_result else 0
+                    ps0p_total = percentile_s0p_best.get("top1", 0) if percentile_s0p_best else 0
                     logging.info(
                         "[EvalCompare] Oracle=%.2f PerLayerKey=%.2f "
-                        "PathRawNLL=%.2f CandidatePathRawNLL=%.2f HybridBest=%.2f "
+                        "PerLayerRawNLL=%.2f PathRawNLL=%.2f CandidatePathRawNLL=%.2f "
+                        "L9HybridBest=%.2f "
+                        "BalancedZBest=%.2f PercentilePath=%.2f PercentileSlot0PenaltyBest=%.2f "
                         "Oracle-gap=%.2f DefaultRouter=%s",
                         oracle_result.get("top1", 0), key_result.get("top1", 0),
+                        raw_nll_total,
                         path_nll_result.get("top1", 0) if path_nll_result else 0,
                         cand_path_result.get("top1", 0) if cand_path_result else 0,
                         hybrid_result.get("top1", 0) if hybrid_result else 0,
-                        oracle_result.get("top1", 0) - key_result.get("top1", 0),
+                        bz_total, perc_total, ps0p_total,
+                        oracle_result.get("top1", 0) - raw_nll_total,
                         self.default_router,
                     )
                 # Phase-8.7: head stabilization with pre_known range
@@ -791,6 +872,53 @@ class GASELearner(BaseLearner):
                 "oracle": {"top1": float(self.phase6_oracle_eval["top1"]) if self.phase6_oracle_eval else None},
                 "per_layer_key": {"top1": float(self.phase6_key_eval["top1"]) if self.phase6_key_eval else None},
             }
+
+            # Phase-9.6: path gate results
+            if self.path_gate_eval:
+                data["path_gate"] = {}
+                if self.phase96_cand_margin_eval:
+                    sweep = self.phase96_cand_margin_eval.get("sweep", {})
+                    data["path_gate"]["candidate_margin"] = {
+                        k: {"top1": v.get("top1", 0), "path_ratio": v.get("path_ratio", 0)}
+                        for k, v in sweep.items()
+                    }
+                    data["path_gate"]["candidate_margin"]["best_tau"] = self.phase96_cand_margin_eval.get("best_tau")
+                if self.phase96_layer_agreement_eval:
+                    sweep = self.phase96_layer_agreement_eval.get("sweep", {})
+                    data["path_gate"]["layer_agreement"] = {
+                        k: {"top1": v.get("top1", 0), "path_ratio": v.get("path_ratio", 0)}
+                        for k, v in sweep.items()
+                    }
+                    data["path_gate"]["layer_agreement"]["best_agreement_min"] = self.phase96_layer_agreement_eval.get("best_agreement_min")
+                if self.phase96_cand_agreement_eval:
+                    sweep = self.phase96_cand_agreement_eval.get("sweep", {})
+                    data["path_gate"]["candidate_agreement"] = {
+                        k: {"top1": v.get("top1", 0), "path_ratio": v.get("path_ratio", 0)}
+                        for k, v in sweep.items()
+                    }
+                    data["path_gate"]["candidate_agreement"]["best_tau"] = self.phase96_cand_agreement_eval.get("best_tau")
+                    data["path_gate"]["candidate_agreement"]["best_agreement_min"] = self.phase96_cand_agreement_eval.get("best_agreement_min")
+
+            # Phase-9.7: path score variants
+            if self.path_score_eval:
+                data["path_score_variants"] = {}
+                if self.phase97_balanced_z_eval:
+                    sweep = self.phase97_balanced_z_eval.get("sweep", {})
+                    data["path_score_variants"]["balanced_z"] = {
+                        k: {"top1": v.get("top1", 0)} for k, v in sweep.items()
+                    }
+                    data["path_score_variants"]["balanced_z"]["best_gamma0"] = self.phase97_balanced_z_eval.get("best_gamma0")
+                if self.phase97_percentile_eval:
+                    data["path_score_variants"]["percentile"] = {
+                        "top1": self.phase97_percentile_eval.get("top1", 0)
+                    }
+                if self.phase97_percentile_s0p_eval:
+                    sweep = self.phase97_percentile_s0p_eval.get("sweep", {})
+                    data["path_score_variants"]["percentile_slot0_penalty"] = {
+                        k: {"top1": v.get("top1", 0)} for k, v in sweep.items()
+                    }
+                    data["path_score_variants"]["percentile_slot0_penalty"]["best_gamma0"] = self.phase97_percentile_s0p_eval.get("best_gamma0")
+
             with open(path, "w") as f:
                 json.dump(data, f, indent=2)
             logging.info("[MetricsJSON] saved to %s", path)
@@ -1344,6 +1472,712 @@ class GASELearner(BaseLearner):
             logging.warning("[HybridEquivCheck] EQUIVALENCE FAILED! "
                           "Hybrid(-inf) should == PathRawNLL, Hybrid(+inf) should == PerLayerRawNLL")
 
+    # ==================================================================
+    #  Phase-9.6: Normalized candidate-path margin + layer-agreement gate
+    # ==================================================================
+
+    def _compute_normalized_candidate_path_data(self, data_loader):
+        """Phase 1: collect per-layer h_chart + compute normalized path scores.
+
+        Returns dict with keys:
+            all_inputs_cat  [N, C, H, W]
+            all_targets_cat [N]
+            all_best_path   [N]          best path slot per sample
+            all_margin      [N]          candidate_path_margin per sample
+            all_best_score  [N]          best path score per sample
+            all_second_score[N]          second-best path score per sample
+            all_per_layer_slots [N, 3]   per-layer independent best slots (L9, L10, L11)
+            all_agreement   [N]          layer_agreement count (0-3)
+            available_slots list[int]    candidate slot IDs
+        """
+        from gase.routing.nll_router import CalibratedNLLSlotRouter
+        backbone = self._network.backbone
+        router = CalibratedNLLSlotRouter(temperature=1.0, calibrate_nll=False, use_logdet=True)
+        backbone.set_nll_router(router)
+        backbone.eval()
+
+        all_inputs_list, all_targets_list = [], []
+        all_best_path_list, all_margin_list, all_best_score_list, all_second_score_list = [], [], [], []
+        all_per_layer_list, all_agreement_list = [], []
+        available_slots = None
+        eps = 1e-6
+
+        with torch.no_grad():
+            for bi, (_, inputs_in, targets) in enumerate(data_loader):
+                inputs_in = inputs_in.to(self._device)
+                B = inputs_in.shape[0]
+
+                # Determine available slots (intersection across all atlas layers)
+                avail = None
+                for lid in self.atlas_layers:
+                    blk = backbone.get_block(lid)
+                    s = set(blk.get_available_slot_ids(0))
+                    avail = s if avail is None else avail & s
+                avail = sorted(avail) if avail else []
+                if available_slots is None:
+                    available_slots = avail
+
+                if len(avail) < 2:
+                    zeros = torch.zeros(B, dtype=torch.long, device=self._device)
+                    inf = torch.full([B], float("inf"), device=self._device)
+                    all_best_path_list.append(zeros.cpu())
+                    all_margin_list.append(inf.cpu())
+                    all_best_score_list.append(inf.cpu())
+                    all_second_score_list.append(inf.cpu())
+                    all_per_layer_list.append(torch.zeros(B, 3, dtype=torch.long).cpu())
+                    all_agreement_list.append(torch.zeros(B, dtype=torch.long).cpu())
+                    all_inputs_list.append(inputs_in.cpu())
+                    all_targets_list.append(targets)
+                    continue
+
+                # Collect h_chart at each atlas layer via KEY_SLOT_STUDENT forward
+                _ = backbone.compute_key_slot_logits(inputs_in)
+                h_by_layer: Dict[int, torch.Tensor] = {}
+                for lid in self.atlas_layers:
+                    blk = backbone.get_block(lid)
+                    if blk.last_h_chart is not None:
+                        h_by_layer[lid] = blk.last_h_chart.detach()
+                    else:
+                        h_by_layer[lid] = backbone._extract_h_chart_at_layer(inputs_in, lid)
+
+                # Compute z-normalized NLL for each candidate slot at each layer
+                num_slots = len(avail)
+                path_scores = torch.zeros(B, num_slots, device=self._device)  # lower=better
+                per_layer_best = torch.zeros(B, len(self.atlas_layers), dtype=torch.long, device=self._device)
+
+                for slot_idx, sid in enumerate(avail):
+                    sid_nll_sum = torch.zeros(B, device=self._device)
+                    for layer_idx, lid in enumerate(self.atlas_layers):
+                        blk = backbone.get_block(lid)
+                        cs = blk.chart_states.get(0)
+                        ss = blk.slot_states.get(f"0_{sid}")
+                        h = h_by_layer[lid]
+                        if cs is not None and ss is not None and h is not None:
+                            raw_nll = router.compute_nll(h, cs, ss)
+                            # z-normalize
+                            self_mean = getattr(ss, "router_nll_mean", None)
+                            self_std = getattr(ss, "router_nll_std", None)
+                            if self_mean is not None and self_std is not None and self_std > 0.1:
+                                z_nll = (raw_nll - self_mean) / (self_std + eps)
+                            else:
+                                z_nll = raw_nll
+                            sid_nll_sum += z_nll
+
+                        # Per-layer independent best
+                        per_layer_nll = []
+                        for sid2 in avail:
+                            ss2 = blk.slot_states.get(f"0_{sid2}")
+                            if cs is not None and ss2 is not None and h is not None:
+                                nll2 = router.compute_nll(h, cs, ss2)
+                                self_mean2 = getattr(ss2, "router_nll_mean", None)
+                                self_std2 = getattr(ss2, "router_nll_std", None)
+                                if self_mean2 is not None and self_std2 is not None and self_std2 > 0.1:
+                                    nll2 = (nll2 - self_mean2) / (self_std2 + eps)
+                                per_layer_nll.append(nll2)
+                            else:
+                                per_layer_nll.append(torch.full([B], float("inf"), device=self._device))
+                        per_layer_stack = torch.stack(per_layer_nll, dim=1)  # [B, S]
+                        per_layer_best[:, layer_idx] = per_layer_stack.argmin(dim=1)
+
+                    path_scores[:, slot_idx] = sid_nll_sum
+
+                # Best path slot and margin
+                best_idx = path_scores.argmin(dim=1)  # [B]
+                best_path_slot = torch.tensor([avail[i.item()] for i in best_idx], dtype=torch.long)
+                best_score = path_scores.gather(1, best_idx.unsqueeze(1)).squeeze(1)  # [B]
+                path_scores_filled = path_scores.clone()
+                path_scores_filled.scatter_(1, best_idx.unsqueeze(1), float("inf"))
+                second_score = path_scores_filled.min(dim=1).values  # [B]
+                margin = second_score - best_score  # [B], positive
+
+                # Layer agreement
+                best_path_idx = best_idx.unsqueeze(1).expand(-1, len(self.atlas_layers))  # [B, 3]
+                agreement = (per_layer_best == best_path_idx).sum(dim=1)  # [B], 0-3
+
+                all_best_path_list.append(best_path_slot.cpu())
+                all_margin_list.append(margin.cpu())
+                all_best_score_list.append(best_score.cpu())
+                all_second_score_list.append(second_score.cpu())
+                all_per_layer_list.append(per_layer_best.cpu())
+                all_agreement_list.append(agreement.cpu())
+                all_inputs_list.append(inputs_in.cpu())
+                all_targets_list.append(targets)
+
+                if bi == 0:
+                    logging.info("[NormPathDebug] num_slots=%d avail=%s path_scores.shape=%s "
+                                 "margin[:10]=%s agreement[:10]=%s best_path[:20]=%s",
+                                 num_slots, avail, list(path_scores.shape),
+                                 margin[:10].tolist(), agreement[:10].tolist(),
+                                 best_path_slot[:20].tolist())
+
+        backbone.set_nll_router(None)
+
+        return {
+            "all_inputs_cat": torch.cat(all_inputs_list),
+            "all_targets_cat": torch.cat(all_targets_list),
+            "all_best_path": torch.cat(all_best_path_list),
+            "all_margin": torch.cat(all_margin_list),
+            "all_best_score": torch.cat(all_best_score_list),
+            "all_second_score": torch.cat(all_second_score_list),
+            "all_per_layer_slots": torch.cat(all_per_layer_list),
+            "all_agreement": torch.cat(all_agreement_list),
+            "available_slots": available_slots or [],
+        }
+
+    def evaluate_path_gate_hybrid_slot_student(self, data_loader, gate_type: str,
+                                                tau_margin: float = None,
+                                                agreement_min: int = None) -> Dict:
+        """Unified path-gate hybrid eval.
+
+        gate_type: "candidate_margin" | "layer_agreement" | "candidate_agreement"
+        """
+        from gase.routing.nll_router import CalibratedNLLSlotRouter
+        backbone = self._network.backbone
+        router = CalibratedNLLSlotRouter(temperature=1.0, calibrate_nll=False, use_logdet=True)
+        backbone.eval()
+
+        data = self._compute_normalized_candidate_path_data(data_loader)
+        all_inputs = data["all_inputs_cat"]
+        all_targets = data["all_targets_cat"]
+        all_best_path = data["all_best_path"]
+        all_margin = data["all_margin"]
+        all_agreement = data["all_agreement"]
+        N = all_targets.shape[0]
+        bs = 16
+
+        # Gate decision
+        if gate_type == "candidate_margin":
+            path_mask = all_margin > tau_margin if tau_margin is not None else torch.ones(N, dtype=torch.bool)
+        elif gate_type == "layer_agreement":
+            path_mask = all_agreement >= agreement_min if agreement_min is not None else torch.ones(N, dtype=torch.bool)
+        elif gate_type == "candidate_agreement":
+            margin_ok = all_margin > tau_margin if tau_margin is not None else torch.ones(N, dtype=torch.bool)
+            agree_ok = all_agreement >= agreement_min if agreement_min is not None else torch.ones(N, dtype=torch.bool)
+            path_mask = margin_ok & agree_ok
+        else:
+            raise ValueError(f"Unknown gate_type: {gate_type}")
+
+        per_layer_mask = ~path_mask
+        path_ratio = float(path_mask.float().mean())
+        all_preds, all_labels = [], []
+
+        backbone.set_nll_router(router)
+        try:
+            # Path branch
+            if path_mask.any():
+                idx_path = path_mask.nonzero(as_tuple=True)[0]
+                for start in range(0, len(idx_path), bs):
+                    batch_idx = idx_path[start:start+bs]
+                    x_sub = all_inputs[batch_idx].to(self._device)
+                    s_sub = all_best_path[batch_idx].to(self._device)
+                    backbone._clear_path_slot_ids()
+                    for lid in self.atlas_layers:
+                        backbone.blocks[lid].path_slot_id = s_sub
+                    backbone.set_adapter_mode("path_key_slot_student")
+                    try:
+                        logits = backbone.forward(x_sub)["logits"][:, :self._total_classes]
+                    finally:
+                        backbone.set_adapter_mode("task_train")
+                    topk = torch.topk(logits, k=self.topk, dim=1)[1]
+                    all_preds.append((batch_idx, topk.cpu().numpy()))
+                    all_labels.append((batch_idx, all_targets[batch_idx].cpu().numpy()))
+
+            # Per-layer branch
+            if per_layer_mask.any():
+                idx_pl = per_layer_mask.nonzero(as_tuple=True)[0]
+                for start in range(0, len(idx_pl), bs):
+                    batch_idx = idx_pl[start:start+bs]
+                    x_sub = all_inputs[batch_idx].to(self._device)
+                    logits = backbone.compute_key_slot_logits(x_sub)[:, :self._total_classes]
+                    topk = torch.topk(logits, k=self.topk, dim=1)[1]
+                    all_preds.append((batch_idx, topk.cpu().numpy()))
+                    all_labels.append((batch_idx, all_targets[batch_idx].cpu().numpy()))
+        finally:
+            backbone.set_nll_router(None)
+
+        if all_preds:
+            idx_concat = np.concatenate([p[0].cpu().numpy() for p in all_preds])
+            pred_concat = np.concatenate([p[1] for p in all_preds])
+            label_concat = np.concatenate([l[1] for l in all_labels])
+            sort_idx = np.argsort(idx_concat)
+            y_pred = pred_concat[sort_idx]
+            y_true = label_concat[sort_idx]
+            result = self._evaluate(y_pred, y_true)
+        else:
+            result = {"top1": 0.0, "grouped": {}}
+
+        total = result.get("top1", 0)
+
+        # Logging
+        if gate_type == "candidate_margin":
+            logging.info("[CandidateMarginHybridEval][tau=%.1f] total=%.2f path_ratio=%.2f",
+                         tau_margin, total, path_ratio)
+        elif gate_type == "layer_agreement":
+            logging.info("[LayerAgreementHybridEval][agreement_min=%d] total=%.2f path_ratio=%.2f",
+                         agreement_min, total, path_ratio)
+        elif gate_type == "candidate_agreement":
+            logging.info("[CandidateAgreementHybridEval][tau=%.1f][agreement_min=%d] total=%.2f path_ratio=%.2f",
+                         tau_margin, agreement_min, total, path_ratio)
+
+        for key, val in sorted(result.get("grouped", {}).items()):
+            if "-" in key:
+                logging.info("[%s] %s=%.2f", "PathGateHybrid", key, val)
+
+        result["path_ratio"] = path_ratio
+        return result
+
+    # --- Sweep wrappers ---
+
+    def _run_candidate_margin_sweep(self, data_loader, tau_list, path_data=None):
+        results = {}
+        best_result, best_total, best_tau = None, 0.0, 0.0
+        for tau in tau_list:
+            r = self.evaluate_path_gate_hybrid_slot_student(
+                data_loader, gate_type="candidate_margin", tau_margin=tau)
+            results[f"tau_{tau:.1f}"] = r
+            total = r.get("top1", 0)
+            if total > best_total:
+                best_total, best_result, best_tau = total, r, tau
+        if best_result:
+            logging.info("[CandidateMarginHybridBest] task=%d best_tau=%.1f total=%.2f",
+                         self._cur_task, best_tau, best_total)
+        return {"sweep": results, "best_tau": best_tau, "best_result": best_result}
+
+    def _run_layer_agreement_sweep(self, data_loader, agreement_list):
+        results = {}
+        best_result, best_total, best_agreement = None, 0.0, 0
+        for agree_min in agreement_list:
+            r = self.evaluate_path_gate_hybrid_slot_student(
+                data_loader, gate_type="layer_agreement", agreement_min=agree_min)
+            results[f"agreement_{agree_min}"] = r
+            total = r.get("top1", 0)
+            if total > best_total:
+                best_total, best_result, best_agreement = total, r, agree_min
+        if best_result:
+            logging.info("[LayerAgreementHybridBest] task=%d best_agreement_min=%d total=%.2f",
+                         self._cur_task, best_agreement, best_total)
+        return {"sweep": results, "best_agreement_min": best_agreement, "best_result": best_result}
+
+    def _run_candidate_agreement_sweep(self, data_loader, tau_list, agreement_list):
+        results = {}
+        best_result, best_total, best_tau, best_agreement = None, 0.0, 0.0, 0
+        for tau in tau_list:
+            for agree_min in agreement_list:
+                r = self.evaluate_path_gate_hybrid_slot_student(
+                    data_loader, gate_type="candidate_agreement",
+                    tau_margin=tau, agreement_min=agree_min)
+                results[f"tau_{tau:.1f}_agreement_{agree_min}"] = r
+                total = r.get("top1", 0)
+                if total > best_total:
+                    best_total, best_result, best_tau, best_agreement = total, r, tau, agree_min
+        if best_result:
+            logging.info("[CandidateAgreementHybridBest] task=%d best_tau=%.1f best_agreement_min=%d total=%.2f",
+                         self._cur_task, best_tau, best_agreement, best_total)
+        return {"sweep": results, "best_tau": best_tau,
+                "best_agreement_min": best_agreement, "best_result": best_result}
+
+    # --- Diagnostics ---
+
+    def _log_path_gate_diagnostics(self, data_loader) -> Dict:
+        """Log normalized path score stats, best_slot hist, and layer agreement distrib."""
+        data = self._compute_normalized_candidate_path_data(data_loader)
+        margin = data["all_margin"].float()
+        best_score = data["all_best_score"].float()
+        second_score = data["all_second_score"].float()
+        best_path = data["all_best_path"]
+        agreement = data["all_agreement"]
+        avail = data["available_slots"]
+        num_slots = len(avail)
+        margin_skipped = num_slots < 2
+
+        # Overall stats
+        if margin_skipped:
+            logging.info("[NormPathScoreStats] task=%d num_slots=%d margin_skipped=True",
+                         self._cur_task, num_slots)
+        else:
+            logging.info("[NormPathScoreStats] task=%d "
+                         "best_score_mean=%.2f best_score_std=%.2f "
+                         "second_score_mean=%.2f second_score_std=%.2f "
+                         "margin_mean=%.2f margin_std=%.2f "
+                         "margin_q05=%.2f margin_q25=%.2f margin_q50=%.2f margin_q75=%.2f margin_q95=%.2f",
+                         self._cur_task,
+                         float(best_score.mean()), float(best_score.std()),
+                         float(second_score.mean()), float(second_score.std()),
+                         float(margin.mean()), float(margin.std()),
+                         float(torch.quantile(margin, 0.05)), float(torch.quantile(margin, 0.25)),
+                         float(torch.quantile(margin, 0.50)), float(torch.quantile(margin, 0.75)),
+                         float(torch.quantile(margin, 0.95)))
+
+        # Best slot histogram
+        slot_hist = {int(s): int((best_path == s).sum()) for s in avail}
+        logging.info("[NormPathBestSlot] task=%d hist=%s", self._cur_task, slot_hist)
+
+        # Layer agreement histogram
+        agree_hist = {int(k): int((agreement == k).sum()) for k in range(4)}
+        logging.info("[LayerAgreementStats] task=%d hist=%s", self._cur_task, agree_hist)
+
+        # Per-source breakdown
+        if not hasattr(self, "_increment"):
+            increment = self.args.get("increment", 10)
+        else:
+            increment = self._increment if self._increment else self.args.get("increment", 10)
+
+        all_targets = data["all_targets_cat"]
+        task_ids = all_targets // increment
+
+        for src in sorted(task_ids.unique().tolist()):
+            smask = task_ids == src
+            n_src = int(smask.sum())
+            if n_src == 0:
+                continue
+            m_src = margin[smask]
+            bp_src = best_path[smask]
+            ag_src = agreement[smask]
+
+            src_slot_hist = {int(s): int((bp_src == s).sum()) for s in avail}
+            src_agree_hist = {int(k): int((ag_src == k).sum()) for k in range(4)}
+
+            if margin_skipped:
+                logging.info("[NormPathScoreStatsByTask] task=%d source=%d n=%d best_slot_hist=%s",
+                             self._cur_task, src, n_src, src_slot_hist)
+            else:
+                logging.info("[NormPathScoreStatsByTask] task=%d source=%d n=%d "
+                             "margin_mean=%.2f margin_q50=%.2f best_slot_hist=%s",
+                             self._cur_task, src, n_src,
+                             float(m_src.mean()), float(torch.quantile(m_src, 0.50)),
+                             src_slot_hist)
+            logging.info("[LayerAgreementStatsByTask] task=%d source=%d hist=%s",
+                         self._cur_task, src, src_agree_hist)
+
+        return {"margin_stats": {"mean": float(margin.mean()), "std": float(margin.std())} if not margin_skipped else {},
+                "best_slot_hist": slot_hist, "layer_agreement_hist": agree_hist}
+
+    # ==================================================================
+    #  Phase-9.7: Slot0 Bias Correction + Path Score Normalization
+    # ==================================================================
+
+    def _log_slot_bias_diagnostics(self) -> None:
+        """Log self-NLL stats and test-set NLL stats per slot for bias analysis."""
+        from gase.routing.nll_router import CalibratedNLLSlotRouter
+        backbone = self._network.backbone
+        router = CalibratedNLLSlotRouter(temperature=1.0, calibrate_nll=False, use_logdet=True)
+        backbone.eval()
+
+        for lid in self.atlas_layers:
+            blk = backbone.get_block(lid)
+            cs = blk.chart_states.get(0)
+            if cs is None:
+                continue
+            available = blk.get_available_slot_ids(0)
+
+            # Self NLL stats (from slot build time)
+            for sid in available:
+                ss = blk.slot_states.get(f"0_{sid}")
+                if ss is not None:
+                    logging.info("[SlotBiasDiag] task=%d layer=%d slot=%d "
+                                 "self_mean=%.2f self_std=%.2f "
+                                 "q05=%.2f q25=%.2f q50=%.2f q75=%.2f q90=%.2f q95=%.2f logdet=%.2f",
+                                 self._cur_task, lid, sid,
+                                 getattr(ss, "router_nll_mean", float("nan")),
+                                 getattr(ss, "router_nll_std", float("nan")),
+                                 getattr(ss, "router_nll_q05", float("nan")),
+                                 getattr(ss, "router_nll_q25", float("nan")),
+                                 getattr(ss, "router_nll_q50", float("nan")),
+                                 getattr(ss, "router_nll_q75", float("nan")),
+                                 getattr(ss, "router_nll_q90", float("nan")),
+                                 getattr(ss, "router_nll_q95", float("nan")),
+                                 getattr(ss, "router_logdet", float("nan")))
+
+            # Test NLL stats: compute raw NLL on test set via single forward
+            backbone.set_nll_router(router)
+            slot_test_nlls = {sid: [] for sid in available}
+            with torch.no_grad():
+                for _, inputs, _ in self.test_loader:
+                    inputs = inputs.to(self._device)
+                    _ = backbone.compute_key_slot_logits(inputs)
+                    h = blk.last_h_chart
+                    if h is None:
+                        continue
+                    for sid in available:
+                        ss = blk.slot_states.get(f"0_{sid}")
+                        if ss is not None and cs is not None:
+                            nll = router.compute_nll(h, cs, ss)
+                            slot_test_nlls[sid].append(nll.cpu())
+            backbone.set_nll_router(None)
+
+            for sid in available:
+                if slot_test_nlls[sid]:
+                    all_nll = torch.cat(slot_test_nlls[sid])
+                    logging.info("[SlotTestNLLStats] task=%d layer=%d slot=%d "
+                                 "mean=%.2f std=%.2f q50=%.2f q90=%.2f",
+                                 self._cur_task, lid, sid,
+                                 float(all_nll.mean()), float(all_nll.std()),
+                                 float(torch.quantile(all_nll, 0.50)),
+                                 float(torch.quantile(all_nll, 0.90)))
+
+            # Score comparison: aggregate per-slot raw, z, percentile means
+            slot_raw_mean = {}
+            slot_z_mean = {}
+            with torch.no_grad():
+                for _, inputs, _ in self.test_loader:
+                    inputs = inputs.to(self._device)
+                    _ = backbone.compute_key_slot_logits(inputs)
+                    h = blk.last_h_chart
+                    if h is None:
+                        continue
+                    for sid in available:
+                        ss = blk.slot_states.get(f"0_{sid}")
+                        if ss is not None and cs is not None:
+                            raw = router.compute_nll(h, cs, ss)
+                            self_mean = getattr(ss, "router_nll_mean", 0)
+                            self_std = getattr(ss, "router_nll_std", 1)
+                            z = (raw - self_mean) / (self_std + 1e-6) if self_std > 0.1 else raw
+                            slot_raw_mean.setdefault(sid, []).append(raw.cpu())
+                            slot_z_mean.setdefault(sid, []).append(z.cpu())
+
+            for sid in available:
+                if sid in slot_raw_mean and slot_raw_mean[sid]:
+                    raw_all = torch.cat(slot_raw_mean[sid])
+                    z_all = torch.cat(slot_z_mean[sid])
+                    logging.info("[SlotScoreBias] task=%d layer=%d "
+                                 "slot=%d raw_mean=%.2f z_mean=%.2f "
+                                 "z_q10=%.2f z_q50=%.2f z_q90=%.2f",
+                                 self._cur_task, lid, sid,
+                                 float(raw_all.mean()), float(z_all.mean()),
+                                 float(torch.quantile(z_all, 0.10)),
+                                 float(torch.quantile(z_all, 0.50)),
+                                 float(torch.quantile(z_all, 0.90)))
+
+    @staticmethod
+    def _approx_percentile(value: torch.Tensor, slot) -> torch.Tensor:
+        """Approximate percentile using stored quantiles (piecewise linear)."""
+        qs = torch.tensor([0.05, 0.10, 0.25, 0.50, 0.75, 0.90, 0.95], device=value.device)
+        qvals_list = []
+        for attr in ["router_nll_q05", "router_nll_q10", "router_nll_q25",
+                     "router_nll_q50", "router_nll_q75", "router_nll_q90", "router_nll_q95"]:
+            v = getattr(slot, attr, None)
+            if v is not None:
+                qvals_list.append(float(v))
+            else:
+                qvals_list.append(0.0)
+        qvals = torch.tensor(qvals_list, device=value.device)
+
+        perc = torch.zeros_like(value)
+        for i in range(len(qs) - 1):
+            mask = (value >= qvals[i]) & (value < qvals[i + 1])
+            alpha = (value - qvals[i]) / (qvals[i + 1] - qvals[i] + 1e-10)
+            perc = torch.where(mask, qs[i] + alpha * (qs[i + 1] - qs[i]), perc)
+        perc = torch.where(value < qvals[0], torch.tensor(0.01, device=value.device), perc)
+        perc = torch.where(value >= qvals[-1], torch.tensor(0.99, device=value.device), perc)
+        return perc
+
+    def _compute_variant_path_data(self, data_loader, score_type: str, gamma0: float = 0.0):
+        """Compute path scores for a given variant and return per-sample tensors.
+
+        score_type: "balanced_z" | "percentile" | "percentile_s0p"
+        """
+        from gase.routing.nll_router import CalibratedNLLSlotRouter
+        backbone = self._network.backbone
+        router = CalibratedNLLSlotRouter(temperature=1.0, calibrate_nll=False, use_logdet=True)
+        backbone.set_nll_router(router)
+        backbone.eval()
+
+        all_inputs_list, all_targets_list = [], []
+        all_best_path_list, all_margin_list, all_best_score_list = [], [], []
+        available_slots = None
+        eps = 1e-6
+
+        with torch.no_grad():
+            for bi, (_, inputs_in, targets) in enumerate(data_loader):
+                inputs_in = inputs_in.to(self._device)
+                B = inputs_in.shape[0]
+
+                avail = None
+                for lid in self.atlas_layers:
+                    blk = backbone.get_block(lid)
+                    s = set(blk.get_available_slot_ids(0))
+                    avail = s if avail is None else avail & s
+                avail = sorted(avail) if avail else []
+                if available_slots is None:
+                    available_slots = avail
+
+                if len(avail) < 2:
+                    zeros = torch.zeros(B, dtype=torch.long, device=self._device)
+                    all_best_path_list.append(zeros.cpu())
+                    all_margin_list.append(torch.zeros(B).cpu())
+                    all_best_score_list.append(torch.zeros(B).cpu())
+                    all_inputs_list.append(inputs_in.cpu())
+                    all_targets_list.append(targets)
+                    continue
+
+                num_slots = len(avail)
+                _ = backbone.compute_key_slot_logits(inputs_in)
+                h_by_layer = {}
+                for lid in self.atlas_layers:
+                    blk = backbone.get_block(lid)
+                    if blk.last_h_chart is not None:
+                        h_by_layer[lid] = blk.last_h_chart.detach()
+                    else:
+                        h_by_layer[lid] = backbone._extract_h_chart_at_layer(inputs_in, lid)
+
+                path_scores = torch.zeros(B, num_slots, device=self._device)
+
+                for slot_idx, sid in enumerate(avail):
+                    sid_sum = torch.zeros(B, device=self._device)
+                    for lid in self.atlas_layers:
+                        blk = backbone.get_block(lid)
+                        cs = blk.chart_states.get(0)
+                        ss = blk.slot_states.get(f"0_{sid}")
+                        h = h_by_layer[lid]
+                        if cs is not None and ss is not None and h is not None:
+                            raw_nll = router.compute_nll(h, cs, ss)
+                            self_mean = getattr(ss, "router_nll_mean", None)
+                            self_std = getattr(ss, "router_nll_std", None)
+
+                            if score_type == "balanced_z":
+                                if self_mean is not None and self_std is not None and self_std > 0.1:
+                                    score = (raw_nll - self_mean) / (self_std + eps)
+                                else:
+                                    score = raw_nll
+                                if sid == 0:
+                                    score = score + gamma0
+                            elif score_type in ("percentile", "percentile_s0p"):
+                                score = GASELearner._approx_percentile(raw_nll, ss)
+                                if score_type == "percentile_s0p" and sid == 0:
+                                    score = score + gamma0
+                            else:
+                                score = raw_nll
+                            sid_sum += score
+                    path_scores[:, slot_idx] = sid_sum
+
+                best_idx = path_scores.argmin(dim=1)
+                best_path_slot = torch.tensor([avail[i.item()] for i in best_idx], dtype=torch.long)
+                best_score = path_scores.gather(1, best_idx.unsqueeze(1)).squeeze(1)
+                path_scores_filled = path_scores.clone()
+                path_scores_filled.scatter_(1, best_idx.unsqueeze(1), float("inf"))
+                second_score = path_scores_filled.min(dim=1).values
+                margin = second_score - best_score
+
+                all_best_path_list.append(best_path_slot.cpu())
+                all_margin_list.append(margin.cpu())
+                all_best_score_list.append(best_score.cpu())
+                all_inputs_list.append(inputs_in.cpu())
+                all_targets_list.append(targets)
+
+        backbone.set_nll_router(None)
+
+        return {
+            "all_inputs_cat": torch.cat(all_inputs_list),
+            "all_targets_cat": torch.cat(all_targets_list),
+            "all_best_path": torch.cat(all_best_path_list),
+            "all_margin": torch.cat(all_margin_list),
+            "all_best_score": torch.cat(all_best_score_list),
+            "available_slots": available_slots or [],
+        }
+
+    def evaluate_path_score_variant_slot_student(self, data_loader, score_type: str,
+                                                  gamma0: float = 0.0) -> Dict:
+        """Evaluate path-consistent forward using a specific path score variant.
+
+        score_type: "balanced_z" | "percentile" | "percentile_s0p"
+        """
+        from gase.routing.nll_router import CalibratedNLLSlotRouter
+        backbone = self._network.backbone
+        router = CalibratedNLLSlotRouter(temperature=1.0, calibrate_nll=False, use_logdet=True)
+
+        data = self._compute_variant_path_data(data_loader, score_type, gamma0)
+        all_inputs = data["all_inputs_cat"]
+        all_targets = data["all_targets_cat"]
+        all_best_path = data["all_best_path"]
+        avail = data["available_slots"]
+        N = all_targets.shape[0]
+        bs = 16
+
+        backbone.eval()
+        backbone.set_nll_router(router)
+        all_preds, all_labels = [], []
+
+        try:
+            for start in range(0, N, bs):
+                batch_idx = torch.arange(start, min(start + bs, N))
+                x_sub = all_inputs[batch_idx].to(self._device)
+                s_sub = all_best_path[batch_idx].to(self._device)
+                backbone._clear_path_slot_ids()
+                for lid in self.atlas_layers:
+                    backbone.blocks[lid].path_slot_id = s_sub
+                backbone.set_adapter_mode("path_key_slot_student")
+                try:
+                    logits = backbone.forward(x_sub)["logits"][:, :self._total_classes]
+                finally:
+                    backbone.set_adapter_mode("task_train")
+                topk = torch.topk(logits, k=self.topk, dim=1)[1]
+                all_preds.append(topk.cpu().numpy())
+                all_labels.append(all_targets[batch_idx].cpu().numpy())
+        finally:
+            backbone.set_nll_router(None)
+
+        y_pred = np.concatenate(all_preds)
+        y_true = np.concatenate(all_labels)
+        result = self._evaluate(y_pred, y_true)
+
+        # Logging
+        if score_type == "balanced_z":
+            logging.info("[BalancedPathEval][gamma0=%.1f] total=%.2f", gamma0, result["top1"])
+        elif score_type == "percentile":
+            logging.info("[PercentilePathEval] total=%.2f", result["top1"])
+        elif score_type == "percentile_s0p":
+            logging.info("[PercentileSlot0PenaltyPathEval][gamma0=%.2f] total=%.2f",
+                        gamma0, result["top1"])
+
+        for key, val in sorted(result.get("grouped", {}).items()):
+            if "-" in key:
+                logging.info("[%s][gamma0=%.2f] %s=%.2f", score_type, gamma0, key, val)
+
+        # Best slot histogram
+        slot_hist = {int(s): int((all_best_path == s).sum()) for s in avail}
+        if score_type == "balanced_z":
+            logging.info("[BalancedPathBestSlot][gamma0=%.1f] task=%d hist=%s",
+                        gamma0, self._cur_task, slot_hist)
+        elif score_type == "percentile":
+            logging.info("[PercentilePathBestSlot] task=%d hist=%s", self._cur_task, slot_hist)
+        elif score_type == "percentile_s0p":
+            logging.info("[PercentileSlot0PenaltyBestSlot][gamma0=%.2f] task=%d hist=%s",
+                        gamma0, self._cur_task, slot_hist)
+
+        return result
+
+    # --- Sweep wrappers for Phase-9.7 ---
+
+    def _run_balanced_z_sweep(self, data_loader, gamma0_list):
+        results = {}
+        best_result, best_total, best_gamma = None, 0.0, 0.0
+        for g in gamma0_list:
+            r = self.evaluate_path_score_variant_slot_student(
+                data_loader, score_type="balanced_z", gamma0=g)
+            results[f"gamma0_{g:.1f}"] = r
+            total = r.get("top1", 0)
+            if total > best_total:
+                best_total, best_result, best_gamma = total, r, g
+        if best_result:
+            logging.info("[BalancedPathBest] task=%d best_gamma0=%.1f total=%.2f",
+                        self._cur_task, best_gamma, best_total)
+        return {"sweep": results, "best_gamma0": best_gamma, "best_result": best_result}
+
+    def _run_percentile_s0p_sweep(self, data_loader, gamma0_list):
+        results = {}
+        best_result, best_total, best_gamma = None, 0.0, 0.0
+        for g in gamma0_list:
+            r = self.evaluate_path_score_variant_slot_student(
+                data_loader, score_type="percentile_s0p", gamma0=g)
+            results[f"gamma0_{g:.2f}"] = r
+            total = r.get("top1", 0)
+            if total > best_total:
+                best_total, best_result, best_gamma = total, r, g
+        if best_result:
+            logging.info("[PercentileSlot0PenaltyBest] task=%d best_gamma0=%.2f total=%.2f",
+                        self._cur_task, best_gamma, best_total)
+        return {"sweep": results, "best_gamma0": best_gamma, "best_result": best_result}
+
     def _eval_with_router(self, data_loader, router_name: str, router) -> Dict:
         """Evaluate PerLayerKey with a specific router, using custom log prefix."""
         backbone = self._network.backbone
@@ -1428,10 +2262,23 @@ class GASELearner(BaseLearner):
         cand_path_total = self.phase6_cand_path_eval.get("top1", 0) if self.phase6_cand_path_eval else 0
         hybrid_total = self.phase6_hybrid_eval.get("top1", 0) if self.phase6_hybrid_eval else 0
 
+        # Phase-9.6: path gate variants
+        cm_total = self.phase96_cand_margin_eval.get("best_result", {}).get("top1", 0) if self.phase96_cand_margin_eval else 0
+        la_total = self.phase96_layer_agreement_eval.get("best_result", {}).get("top1", 0) if self.phase96_layer_agreement_eval else 0
+        ca_total = self.phase96_cand_agreement_eval.get("best_result", {}).get("top1", 0) if self.phase96_cand_agreement_eval else 0
+
+        # Phase-9.7: path score variants
+        bz_total = self.phase97_balanced_z_eval.get("best_result", {}).get("top1", 0) if self.phase97_balanced_z_eval else 0
+        perc_total = self.phase97_percentile_eval.get("top1", 0) if self.phase97_percentile_eval else 0
+        ps0p_total = self.phase97_percentile_s0p_eval.get("best_result", {}).get("top1", 0) if self.phase97_percentile_s0p_eval else 0
+
         logging.info("[RouterCompare] total: dist=%.2f raw_nll=%.2f path_nll=%.2f "
-                     "cand_path=%.2f hybrid=%.2f calib=%.2f prior=%.2f s0p=%.2f",
+                     "cand_path=%.2f "
+                     "balanced_z=%.2f percentile_path=%.2f percentile_s0p=%.2f "
+                     "calib=%.2f prior=%.2f s0p=%.2f",
                      r_dist, nll_result.get("top1", 0), path_nll_total, cand_path_total,
-                     hybrid_total, calib_result.get("top1", 0), prior_result.get("top1", 0),
+                     bz_total, perc_total, ps0p_total,
+                     calib_result.get("top1", 0), prior_result.get("top1", 0),
                      s0p_result.get("top1", 0))
 
         scores = {
@@ -1441,6 +2288,12 @@ class GASELearner(BaseLearner):
             "path_raw_nll": path_nll_total,
             "candidate_path_raw_nll": cand_path_total,
             "hybrid_path_raw_nll": hybrid_total,
+            "candidate_margin_hybrid": cm_total,
+            "layer_agreement_hybrid": la_total,
+            "candidate_agreement_hybrid": ca_total,
+            "balanced_z": bz_total,
+            "percentile_path": perc_total,
+            "percentile_s0p": ps0p_total,
         }
 
         best = max(scores, key=scores.get)

@@ -110,6 +110,11 @@ class SlotBuilder:
         nll_stats = _compute_self_nll_stats(h_chart, chart_state, slot_state)
         slot_state.router_nll_mean = nll_stats["mean"]
         slot_state.router_nll_std = nll_stats["std"]
+        slot_state.router_nll_q05 = nll_stats["q05"]
+        slot_state.router_nll_q10 = nll_stats["q10"]
+        slot_state.router_nll_q25 = nll_stats["q25"]
+        slot_state.router_nll_q50 = nll_stats["q50"]
+        slot_state.router_nll_q75 = nll_stats["q75"]
         slot_state.router_nll_q90 = nll_stats["q90"]
         slot_state.router_nll_q95 = nll_stats["q95"]
         slot_state.router_logdet = nll_stats["logdet"]
@@ -267,7 +272,7 @@ def _compute_self_nll_stats(h_chart, chart_state, slot_state, eps=1e-6):
     import torch
     Q = chart_state.Q_router if getattr(chart_state, "Q_router", None) is not None else getattr(chart_state, "U", None)
     if Q is None:
-        return {"mean": 0.0, "std": 1.0, "q90": 0.0, "q95": 0.0, "logdet": 0.0}
+        return {"mean": 0.0, "std": 1.0, "q05": 0.0, "q10": 0.0, "q25": 0.0, "q50": 0.0, "q75": 0.0, "q90": 0.0, "q95": 0.0, "logdet": 0.0}
     X = h_chart - chart_state.mu.unsqueeze(0)
     z = X @ Q.to(h_chart.device)
     key = slot_state.router_key.to(h_chart.device)
@@ -277,11 +282,15 @@ def _compute_self_nll_stats(h_chart, chart_state, slot_state, eps=1e-6):
     nll = 0.5 * maha + 0.5 * logdet
     result = {
         "mean": float(nll.mean()), "std": float(nll.std(unbiased=False)),
+        "q05": float(torch.quantile(nll, 0.05)), "q10": float(torch.quantile(nll, 0.10)),
+        "q25": float(torch.quantile(nll, 0.25)), "q50": float(torch.quantile(nll, 0.50)),
+        "q75": float(torch.quantile(nll, 0.75)),
         "q90": float(torch.quantile(nll, 0.90)), "q95": float(torch.quantile(nll, 0.95)),
         "logdet": float(logdet),
     }
-    logging.info("[RouterSelfNLL] layer=%d slot=%d support=%d mean=%.2f std=%.2f q50=%.2f q90=%.2f q95=%.2f logdet=%.2f",
+    logging.info("[RouterSelfNLL] layer=%d slot=%d support=%d mean=%.2f std=%.2f q05=%.2f q25=%.2f q50=%.2f q75=%.2f q90=%.2f q95=%.2f logdet=%.2f",
                  chart_state.layer_id, slot_state.slot_id, h_chart.shape[0],
                  result["mean"], result["std"],
-                 float(torch.quantile(nll, 0.50)), result["q90"], result["q95"], result["logdet"])
+                 result["q05"], result["q25"], result["q50"], result["q75"],
+                 result["q90"], result["q95"], result["logdet"])
     return result

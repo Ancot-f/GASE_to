@@ -54,6 +54,11 @@ class SlotState:
     router_support: int = 0
     router_nll_mean: Optional[float] = None
     router_nll_std: Optional[float] = None
+    router_nll_q05: Optional[float] = None
+    router_nll_q10: Optional[float] = None
+    router_nll_q25: Optional[float] = None
+    router_nll_q50: Optional[float] = None
+    router_nll_q75: Optional[float] = None
     router_nll_q90: Optional[float] = None
     router_nll_q95: Optional[float] = None
     router_logdet: Optional[float] = None
