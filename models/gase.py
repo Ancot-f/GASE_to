@@ -110,6 +110,11 @@ class GASELearner(BaseLearner):
         self.phase97_percentile_eval: Optional[Dict] = None
         self.phase97_percentile_s0p_eval: Optional[Dict] = None
 
+        # Phase-9.8: chart OOD dry-run
+        self.chart_ood_dryrun: bool = args.get("routing", {}).get("chart_ood_dryrun", False)
+        self.chart_ood_config: dict = args.get("routing", {}).get("chart_ood", {})
+        self.phase98_dryrun_results: Optional[Dict] = None
+
         logging.info(
             "GASELearner Phase-2 initialized. atlas_layers=%s, adapter_dim=%d",
             self.atlas_layers, self.adapter_dim,
@@ -514,34 +519,79 @@ class GASELearner(BaseLearner):
                     self.phase97_percentile_s0p_eval = ps0p
                     percentile_s0p_best = ps0p.get("best_result", {})
 
+                # Phase-9.8: chart OOD dry-run
+                dry_chart_result = None
+                dry_chart_oracle_result = None
+                if self.chart_ood_dryrun:
+                    from gase.routing.nll_router import CalibratedNLLSlotRouter
+                    r_nll = CalibratedNLLSlotRouter(temperature=1.0, calibrate_nll=False, use_logdet=True)
+                    raw_nll_pre = self._eval_with_router(self.test_loader, "raw_nll_pre", r_nll)
+                    raw_nll_pre_total = raw_nll_pre.get("top1", 0) if raw_nll_pre else 0
+                    path_nll_pre_total = path_nll_result.get("top1", 0) if path_nll_result else 0
+
+                    self.phase98_dryrun_results = self._run_chart_ood_dryrun(
+                        raw_nll_total=raw_nll_pre_total,
+                        path_nll_total=path_nll_pre_total)
+                    # Extract best results if available
+                    if self.phase98_dryrun_results:
+                        # Find best oracle across methods/K
+                        best_oracle_total = 0
+                        for layer_results in self.phase98_dryrun_results.values():
+                            for method_results in layer_results.values():
+                                for k, res in method_results.items():
+                                    if isinstance(res, dict) and "oracle_eval" in res:
+                                        oe = res["oracle_eval"]
+                                        if isinstance(oe, dict) and oe.get("total", 0) > best_oracle_total:
+                                            best_oracle_total = oe["total"]
+                                            dry_chart_oracle_result = oe
+                        if best_oracle_total > 0:
+                            dry_chart_result = {"top1": best_oracle_total}
+
                 if oracle_result and key_result and path_result:
-                    # Compute PerLayerRawNLL (not available from key_result which uses shared-Q)
                     from gase.routing.nll_router import CalibratedNLLSlotRouter
                     r_nll = CalibratedNLLSlotRouter(temperature=1.0, calibrate_nll=False, use_logdet=True)
                     raw_nll_result = self._eval_with_router(self.test_loader, "raw_nll", r_nll)
                     raw_nll_total = raw_nll_result.get("top1", 0) if raw_nll_result else 0
 
-                    cm_total = cand_margin_best.get("top1", 0) if cand_margin_best else 0
-                    la_total = layer_agreement_best.get("top1", 0) if layer_agreement_best else 0
-                    ca_total = cand_agreement_best.get("top1", 0) if cand_agreement_best else 0
-                    bz_total = balanced_z_best.get("top1", 0) if balanced_z_best else 0
-                    perc_total = percentile_result.get("top1", 0) if percentile_result else 0
-                    ps0p_total = percentile_s0p_best.get("top1", 0) if percentile_s0p_best else 0
-                    logging.info(
-                        "[EvalCompare] Oracle=%.2f PerLayerKey=%.2f "
-                        "PerLayerRawNLL=%.2f PathRawNLL=%.2f CandidatePathRawNLL=%.2f "
-                        "L9HybridBest=%.2f "
-                        "BalancedZBest=%.2f PercentilePath=%.2f PercentileSlot0PenaltyBest=%.2f "
-                        "Oracle-gap=%.2f DefaultRouter=%s",
-                        oracle_result.get("top1", 0), key_result.get("top1", 0),
-                        raw_nll_total,
-                        path_nll_result.get("top1", 0) if path_nll_result else 0,
-                        cand_path_result.get("top1", 0) if cand_path_result else 0,
-                        hybrid_result.get("top1", 0) if hybrid_result else 0,
-                        bz_total, perc_total, ps0p_total,
-                        oracle_result.get("top1", 0) - raw_nll_total,
-                        self.default_router,
-                    )
+                    # Build EvalCompare dynamically (skip disabled evals)
+                    eval_parts = [
+                        f"Oracle={oracle_result.get('top1', 0):.2f}",
+                        f"PerLayerKey={key_result.get('top1', 0):.2f}",
+                        f"PerLayerRawNLL={raw_nll_total:.2f}",
+                        f"PathRawNLL={path_nll_result.get('top1', 0) if path_nll_result else 0:.2f}",
+                        f"CandidatePathRawNLL={cand_path_result.get('top1', 0) if cand_path_result else 0:.2f}",
+                        f"L9HybridBest={hybrid_result.get('top1', 0) if hybrid_result else 0:.2f}",
+                    ]
+                    if self.path_gate_eval:
+                        cm_total = cand_margin_best.get("top1", 0) if cand_margin_best else 0
+                        la_total = layer_agreement_best.get("top1", 0) if layer_agreement_best else 0
+                        ca_total = cand_agreement_best.get("top1", 0) if cand_agreement_best else 0
+                        eval_parts += [
+                            f"CandidateMarginHybridBest={cm_total:.2f}",
+                            f"LayerAgreementHybridBest={la_total:.2f}",
+                            f"CandidateAgreementHybridBest={ca_total:.2f}",
+                        ]
+                    if self.path_score_eval:
+                        bz_total = balanced_z_best.get("top1", 0) if balanced_z_best else 0
+                        perc_total = percentile_result.get("top1", 0) if percentile_result else 0
+                        ps0p_total = percentile_s0p_best.get("top1", 0) if percentile_s0p_best else 0
+                        eval_parts += [
+                            f"BalancedZBest={bz_total:.2f}",
+                            f"PercentilePath={perc_total:.2f}",
+                            f"PercentileSlot0PenaltyBest={ps0p_total:.2f}",
+                        ]
+                    if self.chart_ood_dryrun:
+                        dry_total = dry_chart_oracle_result.get("total", 0) if dry_chart_oracle_result else None
+                        dry_gain = (dry_total - path_nll_result.get("top1", 0)) if dry_total is not None and path_nll_result else None
+                        eval_parts += [
+                            f"DryChartOracleBest={dry_total:.2f}" if dry_total is not None else "DryChartOracleBest=NA",
+                            f"DryChartOracleGainOverPath={dry_gain:+.2f}" if dry_gain is not None else "DryChartOracleGainOverPath=NA",
+                        ]
+                    best_so_far = max(v for v in [path_nll_result.get("top1", 0) if path_nll_result else 0,
+                                                    raw_nll_total] if v > 0)
+                    eval_parts += [f"Oracle-gap={oracle_result.get('top1', 0) - raw_nll_total:.2f}"]
+                    eval_parts += [f"DefaultRouter={self.default_router}"]
+                    logging.info("[EvalCompare] %s", " ".join(eval_parts))
                 # Phase-8.7: head stabilization with pre_known range
                 if self.weight_norm_align and self._cur_task > 0:
                     self._align_new_class_weight_norms(pre_known)
@@ -918,6 +968,24 @@ class GASELearner(BaseLearner):
                         k: {"top1": v.get("top1", 0)} for k, v in sweep.items()
                     }
                     data["path_score_variants"]["percentile_slot0_penalty"]["best_gamma0"] = self.phase97_percentile_s0p_eval.get("best_gamma0")
+
+            # Phase-9.8: chart OOD dry-run results
+            if self.chart_ood_dryrun and self.phase98_dryrun_results:
+                data["chart_ood_dryrun"] = {}
+                for layer_id, layer_results in self.phase98_dryrun_results.items():
+                    data["chart_ood_dryrun"][str(layer_id)] = {}
+                    for method, method_results in layer_results.items():
+                        data["chart_ood_dryrun"][str(layer_id)][method] = {}
+                        for k, res in method_results.items():
+                            if isinstance(res, dict):
+                                data["chart_ood_dryrun"][str(layer_id)][method][str(k)] = {
+                                    "num_charts": res.get("num_charts", 0),
+                                    "quality_gain": res.get("quality_gain", {}),
+                                    "overlap": res.get("overlap", {}),
+                                    "purity": res.get("purity", {}),
+                                    "oracle_eval": res.get("oracle_eval", {}),
+                                    "proposal": res.get("proposal", {}),
+                                }
 
             with open(path, "w") as f:
                 json.dump(data, f, indent=2)
@@ -2178,6 +2246,51 @@ class GASELearner(BaseLearner):
                         self._cur_task, best_gamma, best_total)
         return {"sweep": results, "best_gamma0": best_gamma, "best_result": best_result}
 
+    # ==================================================================
+    #  Phase-9.8: Chart OOD Dry-run
+    # ==================================================================
+
+    def _run_chart_ood_dryrun(self, raw_nll_total: float, path_nll_total: float) -> Optional[Dict]:
+        """Run chart OOD dry-run diagnostics without modifying the model."""
+        from gase.diagnostics.chart_ood_dryrun import ChartOODDryRunner
+        logging.info("[ChartOODDryRun] Phase-9.8: starting dry-run diagnostics...")
+
+        ood_cfg = self.chart_ood_config
+        logging.info("[ChartOODConfig] enabled=%s", ood_cfg.get("enabled", True))
+        logging.info("[ChartOODConfig] dryrun=True")
+        logging.info("[ChartOODConfig] use_labels_for_build=%s", ood_cfg.get("use_labels_for_build", False))
+        logging.info("[ChartOODConfig] use_delta_for_build=%s", ood_cfg.get("use_delta_for_build", False))
+        logging.info("[ChartOODConfig] diagnostics_use_labels=%s", ood_cfg.get("diagnostics_use_labels", True))
+        logging.info("[ChartOODConfig] methods=%s", ood_cfg.get("methods", ["kmeans_pca"]))
+        logging.info("[ChartOODConfig] k_list=%s", ood_cfg.get("k_list", [1, 2, 3]))
+
+        increment = self.args.get("increment", 10)
+        runner = ChartOODDryRunner(
+            backbone=self._network.backbone,
+            atlas_layers=self.atlas_layers,
+            config={
+                **ood_cfg,
+                "increment": increment,
+                "rank": self.args.get("chart", {}).get("rank", 8),
+            },
+        )
+
+        try:
+            results = runner.run_all_diagnostics(
+                data_loader=self.test_loader,
+                total_classes=self._total_classes,
+                raw_nll_total=raw_nll_total,
+                path_nll_total=path_nll_total,
+                increment=increment,
+            )
+            logging.info("[ChartOODDryRun] diagnostics complete")
+            return results
+        except Exception as e:
+            logging.warning("[ChartOODDryRun] failed: %s", e)
+            import traceback
+            logging.warning(traceback.format_exc())
+            return None
+
     def _eval_with_router(self, data_loader, router_name: str, router) -> Dict:
         """Evaluate PerLayerKey with a specific router, using custom log prefix."""
         backbone = self._network.backbone
@@ -2267,19 +2380,40 @@ class GASELearner(BaseLearner):
         la_total = self.phase96_layer_agreement_eval.get("best_result", {}).get("top1", 0) if self.phase96_layer_agreement_eval else 0
         ca_total = self.phase96_cand_agreement_eval.get("best_result", {}).get("top1", 0) if self.phase96_cand_agreement_eval else 0
 
-        # Phase-9.7: path score variants
-        bz_total = self.phase97_balanced_z_eval.get("best_result", {}).get("top1", 0) if self.phase97_balanced_z_eval else 0
-        perc_total = self.phase97_percentile_eval.get("top1", 0) if self.phase97_percentile_eval else 0
-        ps0p_total = self.phase97_percentile_s0p_eval.get("best_result", {}).get("top1", 0) if self.phase97_percentile_s0p_eval else 0
+        # Phase-9.7: path score variants (only if enabled)
+        bz_total = None
+        perc_total = None
+        ps0p_total = None
+        if self.path_score_eval:
+            bz_total = self.phase97_balanced_z_eval.get("best_result", {}).get("top1", 0) if self.phase97_balanced_z_eval else None
+            perc_total = self.phase97_percentile_eval.get("top1", 0) if self.phase97_percentile_eval else None
+            ps0p_total = self.phase97_percentile_s0p_eval.get("best_result", {}).get("top1", 0) if self.phase97_percentile_s0p_eval else None
 
-        logging.info("[RouterCompare] total: dist=%.2f raw_nll=%.2f path_nll=%.2f "
-                     "cand_path=%.2f "
-                     "balanced_z=%.2f percentile_path=%.2f percentile_s0p=%.2f "
-                     "calib=%.2f prior=%.2f s0p=%.2f",
-                     r_dist, nll_result.get("top1", 0), path_nll_total, cand_path_total,
-                     bz_total, perc_total, ps0p_total,
-                     calib_result.get("top1", 0), prior_result.get("top1", 0),
-                     s0p_result.get("top1", 0))
+        # Phase-9.8: dry chart oracle
+        dry_oracle_total = None
+        if self.phase98_dryrun_results:
+            for layer_results in self.phase98_dryrun_results.values():
+                for method_results in layer_results.values():
+                    for k, res in method_results.items():
+                        if isinstance(res, dict) and "oracle_eval" in res:
+                            oe = res["oracle_eval"]
+                            if isinstance(oe, dict):
+                                v = oe.get("total", 0)
+                                if 0 <= v <= 100 and (dry_oracle_total is None or v > dry_oracle_total):
+                                    dry_oracle_total = v
+
+        # Build total line dynamically
+        parts = [f"dist={r_dist:.2f}", f"raw_nll={nll_result.get('top1', 0):.2f}",
+                 f"path_nll={path_nll_total:.2f}", f"cand_path={cand_path_total:.2f}"]
+        if self.path_score_eval and bz_total is not None:
+            parts += [f"balanced_z={bz_total:.2f}", f"percentile_path={perc_total:.2f}",
+                      f"percentile_s0p={ps0p_total:.2f}"]
+        if self.chart_ood_dryrun and dry_oracle_total is not None:
+            parts += [f"dry_chart_oracle={dry_oracle_total:.2f}"]
+        parts += [f"calib={calib_result.get('top1', 0):.2f}",
+                  f"prior={prior_result.get('top1', 0):.2f}",
+                  f"s0p={s0p_result.get('top1', 0):.2f}"]
+        logging.info("[RouterCompare] total: %s", " ".join(parts))
 
         scores = {
             "shared_q_dist": r_dist, "raw_nll": nll_result.get("top1", 0),
@@ -2288,13 +2422,20 @@ class GASELearner(BaseLearner):
             "path_raw_nll": path_nll_total,
             "candidate_path_raw_nll": cand_path_total,
             "hybrid_path_raw_nll": hybrid_total,
-            "candidate_margin_hybrid": cm_total,
-            "layer_agreement_hybrid": la_total,
-            "candidate_agreement_hybrid": ca_total,
-            "balanced_z": bz_total,
-            "percentile_path": perc_total,
-            "percentile_s0p": ps0p_total,
         }
+        if self.path_gate_eval:
+            scores.update({
+                "candidate_margin_hybrid": cm_total,
+                "layer_agreement_hybrid": la_total,
+                "candidate_agreement_hybrid": ca_total,
+            })
+        if self.path_score_eval and bz_total is not None:
+            scores.update({
+                "balanced_z": bz_total, "percentile_path": perc_total,
+                "percentile_s0p": ps0p_total,
+            })
+        if self.chart_ood_dryrun and dry_oracle_total is not None:
+            scores["dry_chart_oracle"] = dry_oracle_total
 
         best = max(scores, key=scores.get)
         logging.info("[RouterCompare] best=%s (%.2f) default=%s (%.2f)", best, scores[best],
