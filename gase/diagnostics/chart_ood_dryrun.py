@@ -165,14 +165,19 @@ class ChartOODDryRunner:
         return cs
 
     def _compute_mahalanobis_d2(self, h: Tensor, cs: ChartState) -> Tensor:
-        """Mahalanobis d2 in shared-Q space."""
-        Q = cs.Q_router.to(h.device)
-        X = h.to(h.device) - cs.mu.unsqueeze(0).to(h.device)
-        z = X @ Q
-        ev = cs.router_eigvals if cs.router_eigvals is not None else torch.ones(cs.U.shape[1])
-        ev_safe = ev.clamp_min(1e-6).to(h.device)
-        d2 = ((z ** 2) / (ev_safe + cs.sigma_perp).unsqueeze(0)).sum(dim=-1)
-        return d2
+        """PPCA Mahalanobis d2, matching PPCAEstimator._ppca_mahalanobis_d2 formula.
+
+        d^2 = sum_k (z_k^2 / (eigval_k + eps)) + ||residual||^2 / (sigma_perp^2 + eps)
+        """
+        X = h.to(cs.mu.device) - cs.mu.unsqueeze(0)
+        z = X @ cs.U.to(h.device)  # [N, rank]
+        ev = cs.eigvals if cs.eigvals is not None else torch.ones(cs.U.shape[1], device=h.device)
+        ev_safe = ev.clamp_min(1e-8).to(h.device)
+        tangent_term = (z ** 2 / ev_safe.unsqueeze(0)).sum(dim=-1)
+        residual = X - z @ cs.U.T.to(h.device)
+        residual_sq = (residual ** 2).sum(dim=-1)
+        normal_term = residual_sq / max(cs.sigma_perp ** 2, 1e-8)
+        return tangent_term + normal_term
 
     # ------------------------------------------------------------------
     #  Method 1: KMeans + local PCA
@@ -790,17 +795,218 @@ class ChartOODDryRunner:
                 "overlap": overlap, "slot0_ratio_change": slot0_ratio_change}
 
     # ------------------------------------------------------------------
-    #  Full dry-run pipeline
+    #  Phase-9.8-radius: Radius sweep and hard Voronoi
+    # ------------------------------------------------------------------
+
+    def _build_ppca_chart_with_radius(self, h_local: Tensor, chart_id: int, layer_id: int,
+                                       radius_quantile: float) -> Optional[ChartState]:
+        """Build PPCA chart with explicit radius quantile."""
+        N = h_local.shape[0]
+        if N < self.min_support:
+            return None
+
+        ppca = PPCAEstimator(dim=h_local.shape[1], rank=self.rank)
+        ppca.fit(h_local, self.rank)
+
+        cs = ChartState(chart_id=chart_id, layer_id=layer_id)
+        cs.mu = ppca.mu.clone().detach()
+        cs.U = ppca.U.clone().detach()
+        cs.eigvals = ppca.eigvals.clone().detach()
+        cs.sigma_perp = max(ppca.sigma_perp, self.regularize_sigma)
+        cs.n_support = N
+        cs.Q_router = cs.U
+        cs.router_eigvals = cs.eigvals.clone()
+        cs.router_rank = self.rank
+
+        # Recompute radius with the specified quantile
+        d2_train = self._compute_mahalanobis_d2(h_local, cs)
+        cs.radius_d2 = float(torch.quantile(d2_train, radius_quantile))
+
+        return cs
+
+    def build_charts_with_radius(self, h_all: Tensor, layer_id: int, method: str,
+                                  k: int, radius_quantile: float) -> List[ChartState]:
+        """Build candidate charts with a specific radius quantile."""
+        if method in ("kmeans_pca", "spectral_pca_split"):
+            if method == "kmeans_pca":
+                labels, _ = torch_kmeans(h_all, k=k, num_iters=50)
+            else:
+                cs_full = self._build_ppca_chart(h_all, chart_id=-1, layer_id=layer_id)
+                if cs_full is None:
+                    return []
+                X = h_all - cs_full.mu.unsqueeze(0)
+                z = X @ cs_full.U
+                actual_k = min(k, h_all.shape[0] // self.min_support)
+                labels, _ = torch_kmeans(z, k=actual_k, num_iters=50)
+
+            charts = []
+            for cid in range(k):
+                mask = labels == cid
+                n_c = int(mask.sum())
+                if n_c < self.min_support:
+                    continue
+                cs = self._build_ppca_chart_with_radius(h_all[mask], chart_id=cid,
+                                                        layer_id=layer_id,
+                                                        radius_quantile=radius_quantile)
+                if cs is not None:
+                    charts.append(cs)
+            return charts
+
+        elif method == "mahalanobis_outlier_split":
+            cs0 = self._build_ppca_chart_with_radius(h_all, chart_id=0, layer_id=layer_id,
+                                                      radius_quantile=radius_quantile)
+            if cs0 is None:
+                return []
+            return self.build_mahalanobis_outlier_charts(h_all, layer_id, cs0)
+
+        return []
+
+    def _compute_radius_scale_diag(self, charts: List[ChartState], h_all: Tensor,
+                                    layer_id: int, method: str, k: int,
+                                    radius_quantile: float) -> None:
+        """Log per-chart train/test d2 stats and radius values."""
+        for cs in charts:
+            d2_all = self._compute_mahalanobis_d2(h_all, cs)
+            logging.info("[RadiusScaleDiag] method=%s layer=%d k=%d chart=%d rq=%.2f "
+                         "train_d2_mean=%.1f train_d2_q50=%.1f train_d2_q90=%.1f train_d2_q95=%.1f "
+                         "radius_q=%.1f",
+                         method, layer_id, k, cs.chart_id, radius_quantile,
+                         float(d2_all.mean()), float(torch.quantile(d2_all, 0.50)),
+                         float(torch.quantile(d2_all, 0.90)), float(torch.quantile(d2_all, 0.95)),
+                         cs.radius_d2)
+
+    def _compute_overlap_count_stats(self, charts: List[ChartState], h_all: Tensor,
+                                      layer_id: int, method: str, k: int,
+                                      radius_quantile: float) -> Dict:
+        """Count how many chart radii each sample falls within."""
+        if len(charts) < 2:
+            return {"mean_overlap_count": 1.0}
+
+        N = h_all.shape[0]
+        in_radius = torch.zeros(N, len(charts), dtype=torch.bool)
+        for i, cs in enumerate(charts):
+            d2 = self._compute_mahalanobis_d2(h_all, cs)
+            in_radius[:, i] = d2 <= cs.radius_d2
+        n_in = in_radius.sum(dim=1).float()
+
+        logging.info("[OverlapCountStats] method=%s layer=%d k=%d rq=%.2f "
+                     "mean=%.2f q50=%.1f q90=%.1f max=%d",
+                     method, layer_id, k, radius_quantile,
+                     float(n_in.mean()), float(torch.quantile(n_in, 0.50)),
+                     float(torch.quantile(n_in, 0.90)), int(n_in.max()))
+
+        is_suspect = float(n_in.mean()) > 1.5 and radius_quantile <= 0.50
+        if is_suspect:
+            logging.info("[OverlapDiag][SUSPECT] method=%s layer=%d k=%d rq=%.2f "
+                         "mean_overlap=%.2f — should be near 1.0 at low quantile",
+                         method, layer_id, k, radius_quantile, float(n_in.mean()))
+
+        return {"mean_overlap_count": float(n_in.mean()),
+                "q50": float(torch.quantile(n_in, 0.50)),
+                "suspected_bug": is_suspect}
+
+    def _compute_hard_voronoi_routing(self, charts: List[ChartState], h_all: Tensor,
+                                       labels: Tensor, layer_id: int, method: str, k: int,
+                                       increment: int = 10) -> Dict:
+        """Hard Voronoi assignment: each sample to nearest chart by d2."""
+        if len(charts) < 2:
+            return {}
+
+        N = h_all.shape[0]
+        d2_all = torch.zeros(N, len(charts))
+        for i, cs in enumerate(charts):
+            d2_all[:, i] = self._compute_mahalanobis_d2(h_all, cs)
+
+        assignments = d2_all.argmin(dim=1)
+        best_d2 = d2_all.min(dim=1).values
+        d2_filled = d2_all.clone()
+        d2_filled.scatter_(1, assignments.unsqueeze(1), float("inf"))
+        second_d2 = d2_filled.min(dim=1).values
+        margin = second_d2 - best_d2
+
+        chart_ids = [cs.chart_id for cs in charts]
+        hist = {int(c): int((assignments == i).sum()) for i, c in enumerate(chart_ids)}
+        boundary_ratio = float((margin < 1.0).float().mean())
+
+        logging.info("[HardVoronoiRouting] method=%s layer=%d k=%d chart_hist=%s "
+                     "margin_mean=%.1f margin_q50=%.1f margin_q90=%.1f boundary=%.3f",
+                     method, layer_id, k, hist,
+                     float(margin.mean()), float(torch.quantile(margin, 0.50)),
+                     float(torch.quantile(margin, 0.90)), boundary_ratio)
+
+        source_tasks = labels // increment
+        for src in sorted(source_tasks.unique().tolist()):
+            smask = source_tasks == src
+            src_hist = {int(c): int((assignments[smask] == i).sum())
+                       for i, c in enumerate(chart_ids)}
+            logging.info("[HardVoronoiRoutingByTask] method=%s layer=%d k=%d source=%d chart_hist=%s",
+                        method, layer_id, k, src, src_hist)
+
+        return {"chart_hist": hist, "margin_mean": float(margin.mean()),
+                "boundary_ratio": boundary_ratio, "assignments": assignments}
+
+    def _compute_hard_voronoi_purity(self, charts: List[ChartState], assignments: Tensor,
+                                      labels: Tensor, layer_id: int, method: str, k: int,
+                                      increment: int = 10) -> Dict:
+        """Purity under hard Voronoi assignment."""
+        if len(charts) < 2:
+            return {"mean_purity": 1.0}
+
+        source_tasks = labels // increment
+        purities = []
+        for cid, cs in enumerate(charts):
+            mask = assignments == cid
+            n = int(mask.sum())
+            if n == 0:
+                continue
+            src = source_tasks[mask]
+            unique, counts = torch.unique(src, return_counts=True)
+            hist = {int(u): int(c) for u, c in zip(unique, counts)}
+            purity = float(counts.max() / counts.sum())
+            purities.append(purity)
+
+        mean_purity = float(np.mean(purities)) if purities else 0.0
+        logging.info("[HardVoronoiPurity] method=%s layer=%d k=%d mean_purity=%.3f",
+                    method, layer_id, k, mean_purity)
+        return {"mean_purity": mean_purity}
+
+    def _compute_radius_tradeoff(self, sweep_results: List[Dict], layer_id: int,
+                                  method: str, k: int) -> Dict:
+        """Summarize coverage-overlap tradeoff across radius quantiles."""
+        logging.info("[RadiusTradeoff] method=%s layer=%d k=%d", method, layer_id, k)
+        best_rq, best_score = None, -float("inf")
+        for r in sweep_results:
+            rq = r["radius_quantile"]
+            cov = r.get("coverage", 0)
+            ovp = r.get("overlap_ratio", 1)
+            bnd = r.get("boundary_ratio", 1)
+            logging.info("[RadiusTradeoff]   rq=%.2f coverage=%.3f overlap=%.3f boundary=%.3f",
+                        rq, cov, ovp, bnd)
+
+            score = cov - 1.5 * ovp - 0.5 * bnd
+            if score > best_score:
+                best_score = score
+                best_rq = rq
+
+        logging.info("[RadiusTradeoffBest] method=%s layer=%d k=%d best_rq=%.2f score=%.3f",
+                    method, layer_id, k, best_rq or 0, best_score)
+        return {"best_rq": best_rq, "best_score": best_score}
+
+    # ------------------------------------------------------------------
+    #  Full dry-run pipeline (updated for radius sweep)
     # ------------------------------------------------------------------
 
     def run_all_diagnostics(self, data_loader, total_classes: int,
                              raw_nll_total: float, path_nll_total: float,
                              increment: int = 10) -> Dict:
-        """Run complete dry-run diagnostics for all methods, layers, and K values."""
+        """Run complete dry-run diagnostics with radius quantile sweep."""
         import warnings
 
         all_results = {}
         features = self.extract_all_layer_features(data_loader)
+
+        # Read radius_quantile_list from config
+        radius_quantile_list = self.config.get("radius_quantile_list", [0.95])
 
         for layer_id in self.atlas_layers:
             h_all, labels_all = features[layer_id]
@@ -818,52 +1024,103 @@ class ChartOODDryRunner:
                 ks = self.k_list if method != "mahalanobis_outlier_split" else [1]
                 for k in ks:
                     if k == 1 and method != "mahalanobis_outlier_split":
-                        continue  # k=1 is single chart, skip
+                        continue
                     if k > h_all.shape[0] // self.min_support:
                         continue
 
                     logging.info("[DryChartRun] layer=%d method=%s k=%d", layer_id, method, k)
 
-                    charts = self.build_candidate_charts(h_all, layer_id, method, k)
-                    if len(charts) < 2:
-                        logging.info("[DryChartRun] layer=%d method=%s k=%d "
-                                    "num_charts=%d skip", layer_id, method, k, len(charts))
+                    res = {}
+                    radius_sweep_results = []
+
+                    for rq in radius_quantile_list:
+                        charts = self.build_charts_with_radius(h_all, layer_id, method, k, rq)
+                        if len(charts) < 2:
+                            continue
+
+                        # Radius scale diagnostics
+                        self._compute_radius_scale_diag(charts, h_all, layer_id, method, k, rq)
+
+                        # Overlap count
+                        oc = self._compute_overlap_count_stats(charts, h_all, layer_id, method, k, rq)
+
+                        # Quality
+                        dry_metrics = self.compute_quality_metrics(charts, h_all, layer_id, method, k)
+                        gain = self.compute_quality_gain(dry_metrics, single_metrics, layer_id, method, k)
+
+                        # Overlap (radius-soft)
+                        overlap = self.compute_overlap(charts, h_all, layer_id, method, k)
+
+                        sweep_entry = {
+                            "radius_quantile": rq,
+                            "coverage": dry_metrics.get("coverage_at_radius", 0),
+                            "overlap_ratio": overlap.get("overlap_ratio", 0),
+                            "boundary_ratio": overlap.get("boundary_ratio", 0),
+                            "d2_gain": gain.get("gain_d2_pct", 0),
+                            "recon_gain": gain.get("gain_recon_pct", 0),
+                            "quality": dry_metrics,
+                            "quality_gain": gain,
+                            "overlap_details": overlap,
+                            "overlap_count": oc,
+                        }
+                        radius_sweep_results.append(sweep_entry)
+
+                        # Store best result for default rq
+                        if rq == radius_quantile_list[-1]:
+                            res["quality"] = dry_metrics
+                            res["quality_gain"] = gain
+                            res["overlap"] = overlap
+                            res["charts"] = charts
+
+                    if not radius_sweep_results:
+                        logging.info("[DryChartRun] layer=%d method=%s k=%d no valid charts",
+                                    layer_id, method, k)
                         continue
 
-                    res = {"num_charts": len(charts)}
+                    res["radius_sweep"] = radius_sweep_results
 
-                    # Quality
-                    dry_metrics = self.compute_quality_metrics(charts, h_all, layer_id, method, k)
-                    gain = self.compute_quality_gain(dry_metrics, single_metrics, layer_id, method, k)
-                    res["quality"] = dry_metrics
-                    res["quality_gain"] = gain
+                    # Radius tradeoff
+                    tradeoff = self._compute_radius_tradeoff(radius_sweep_results, layer_id, method, k)
+                    res["radius_tradeoff"] = tradeoff
 
-                    # Overlap
-                    overlap = self.compute_overlap(charts, h_all, layer_id, method, k)
-                    res["overlap"] = overlap
+                    # Use best rq charts for purity, routing, oracle
+                    best_rq = tradeoff.get("best_rq") or radius_quantile_list[-1]
+                    best_charts = self.build_charts_with_radius(h_all, layer_id, method, k, best_rq)
 
-                    # Purity
-                    purity = self.compute_purity(charts, h_all, labels_all, layer_id, method, k, increment)
-                    res["purity"] = purity
+                    if len(best_charts) >= 2:
+                        # Purity (radius-soft)
+                        purity = self.compute_purity(best_charts, h_all, labels_all, layer_id, method, k, increment)
+                        res["purity"] = purity
 
-                    # Chart routing
-                    chart_routing = self.compute_chart_routing(charts, h_all, labels_all, layer_id, method, k, increment)
-                    res["chart_routing"] = chart_routing
+                        # Hard Voronoi
+                        hv_routing = self._compute_hard_voronoi_routing(best_charts, h_all, labels_all, layer_id, method, k, increment)
+                        res["hard_voronoi_routing"] = hv_routing
+                        hv_purity = self._compute_hard_voronoi_purity(
+                            best_charts, hv_routing.get("assignments", torch.zeros(h_all.shape[0], dtype=torch.long)),
+                            labels_all, layer_id, method, k, increment)
+                        res["hard_voronoi_purity"] = hv_purity
 
-                    # Chart-slot routing
-                    slot_routing = self.compute_chart_slot_routing(charts, h_all, labels_all, layer_id, method, k, increment)
-                    res["slot_routing"] = slot_routing
+                        # Chart-slot routing (hard Voronoi)
+                        hv_sr = self.compute_chart_slot_routing(best_charts, h_all, labels_all, layer_id, method, k, increment)
+                        res["slot_routing"] = hv_sr
 
-                    # Oracle chart eval
-                    oracle = self.oracle_chart_eval(charts, data_loader, layer_id, method, k,
-                                                    total_classes, raw_nll_total, path_nll_total)
-                    res["oracle_eval"] = oracle
+                        # Oracle chart eval — only on primary layer; adapters bound to chart=0
+                        first_atlas = min(self.atlas_layers)
+                        if layer_id != first_atlas:
+                            oracle = {"total": path_nll_total, "gain_over_raw": path_nll_total - raw_nll_total,
+                                      "gain_over_path": 0.0}
+                            logging.info("[DryRunOracleChartEval][SKIP] method=%s k=%d layer=%d "
+                                         "reason=non_primary_layer", method, k, layer_id)
+                        else:
+                            oracle = self.oracle_chart_eval(best_charts, data_loader, layer_id, method, k,
+                                                            total_classes, raw_nll_total, path_nll_total)
+                        res["oracle_eval"] = oracle
 
-                    # Proposal
-                    proposal = self.propose_chart_creation(
-                        gain, purity, overlap, {}, layer_id, method, k,
-                        oracle.get("gain_over_path", 0))
-                    res["proposal"] = proposal
+                        # Proposal
+                        proposal = self.propose_chart_creation(
+                            res.get("quality_gain", {}), purity, res.get("overlap", {}), {},
+                            layer_id, method, k, oracle.get("gain_over_path", 0))
+                        res["proposal"] = proposal
 
                     all_results[layer_id][method][k] = res
 

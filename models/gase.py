@@ -532,20 +532,45 @@ class GASELearner(BaseLearner):
                     self.phase98_dryrun_results = self._run_chart_ood_dryrun(
                         raw_nll_total=raw_nll_pre_total,
                         path_nll_total=path_nll_pre_total)
-                    # Extract best results if available
+                    # Extract best results and log best candidate summary
                     if self.phase98_dryrun_results:
-                        # Find best oracle across methods/K
                         best_oracle_total = 0
-                        for layer_results in self.phase98_dryrun_results.values():
-                            for method_results in layer_results.values():
+                        best_candidate_info = {}
+                        for layer_id, layer_results in self.phase98_dryrun_results.items():
+                            for method, method_results in layer_results.items():
                                 for k, res in method_results.items():
                                     if isinstance(res, dict) and "oracle_eval" in res:
                                         oe = res["oracle_eval"]
-                                        if isinstance(oe, dict) and oe.get("total", 0) > best_oracle_total:
-                                            best_oracle_total = oe["total"]
+                                        v = oe.get("total", 0)
+                                        if isinstance(v, (int, float)) and 0 <= v <= 100 and v > best_oracle_total:
+                                            best_oracle_total = v
                                             dry_chart_oracle_result = oe
+                                            best_candidate_info = {
+                                                "layer": layer_id, "method": method, "k": k,
+                                                "oracle_total": v,
+                                                "d2_gain": res.get("quality_gain", {}).get("gain_d2_pct", 0),
+                                                "recon_gain": res.get("quality_gain", {}).get("gain_recon_pct", 0),
+                                                "overlap": res.get("overlap", {}).get("overlap_ratio", 0),
+                                                "recommend": res.get("proposal", {}).get("recommend", False),
+                                            }
                         if best_oracle_total > 0:
                             dry_chart_result = {"top1": best_oracle_total}
+                        # Log best candidate summary
+                        if best_candidate_info:
+                            logging.info("[ChartRadiusBestCandidate] task=%d layer=%d method=%s k=%s "
+                                         "d2_gain=%.1f%% recon_gain=%.1f%% overlap=%.3f "
+                                         "dry_oracle=%.2f recommend=%s",
+                                         self._cur_task, best_candidate_info.get("layer", -1),
+                                         best_candidate_info.get("method", "?"),
+                                         best_candidate_info.get("k", "?"),
+                                         best_candidate_info.get("d2_gain", 0),
+                                         best_candidate_info.get("recon_gain", 0),
+                                         best_candidate_info.get("overlap", 0),
+                                         best_candidate_info.get("oracle_total", 0),
+                                         best_candidate_info.get("recommend", False))
+                        else:
+                            logging.info("[ChartRadiusBestCandidate] task=%d recommend=False "
+                                         "reason=no_candidate_passed_threshold", self._cur_task)
 
                 if oracle_result and key_result and path_result:
                     from gase.routing.nll_router import CalibratedNLLSlotRouter
@@ -583,9 +608,11 @@ class GASELearner(BaseLearner):
                     if self.chart_ood_dryrun:
                         dry_total = dry_chart_oracle_result.get("total", 0) if dry_chart_oracle_result else None
                         dry_gain = (dry_total - path_nll_result.get("top1", 0)) if dry_total is not None and path_nll_result else None
+                        dry_recommend = best_candidate_info.get("recommend", False) if best_candidate_info else False
                         eval_parts += [
                             f"DryChartOracleBest={dry_total:.2f}" if dry_total is not None else "DryChartOracleBest=NA",
                             f"DryChartOracleGainOverPath={dry_gain:+.2f}" if dry_gain is not None else "DryChartOracleGainOverPath=NA",
+                            f"ChartRadiusBestRecommend={dry_recommend}",
                         ]
                     best_so_far = max(v for v in [path_nll_result.get("top1", 0) if path_nll_result else 0,
                                                     raw_nll_total] if v > 0)
@@ -2263,6 +2290,8 @@ class GASELearner(BaseLearner):
         logging.info("[ChartOODConfig] diagnostics_use_labels=%s", ood_cfg.get("diagnostics_use_labels", True))
         logging.info("[ChartOODConfig] methods=%s", ood_cfg.get("methods", ["kmeans_pca"]))
         logging.info("[ChartOODConfig] k_list=%s", ood_cfg.get("k_list", [1, 2, 3]))
+        logging.info("[ChartRadiusConfig] radius_quantile_list=%s", ood_cfg.get("radius_quantile_list", [0.95]))
+        logging.info("[ChartRadiusConfig] routing_modes=%s", ood_cfg.get("routing_modes", ["radius_soft", "hard_voronoi"]))
 
         increment = self.args.get("increment", 10)
         runner = ChartOODDryRunner(
@@ -2437,9 +2466,19 @@ class GASELearner(BaseLearner):
         if self.chart_ood_dryrun and dry_oracle_total is not None:
             scores["dry_chart_oracle"] = dry_oracle_total
 
-        best = max(scores, key=scores.get)
-        logging.info("[RouterCompare] best=%s (%.2f) default=%s (%.2f)", best, scores[best],
+        # Separate credible routers from diagnostic-only
+        credible_keys = {"shared_q_dist", "raw_nll", "calib_nll", "calib_prior", "slot0_penalty",
+                         "path_raw_nll", "candidate_path_raw_nll", "hybrid_path_raw_nll",
+                         "candidate_margin_hybrid", "layer_agreement_hybrid",
+                         "candidate_agreement_hybrid", "balanced_z", "percentile_path", "percentile_s0p"}
+        credible_scores = {k: v for k, v in scores.items() if k in credible_keys and v is not None}
+        best_cred = max(credible_scores, key=credible_scores.get) if credible_scores else (None, 0)
+        logging.info("[RouterCompare] best_credible=%s (%.2f) default=%s (%.2f)",
+                     best_cred, credible_scores.get(best_cred, 0),
                      self.default_router, scores.get(self.default_router, 0))
+        if "dry_chart_oracle" in scores:
+            logging.info("[RouterCompare] best_diagnostic=dry_chart_oracle (%.2f)",
+                        scores["dry_chart_oracle"])
 
     def evaluate_aggregated_path_key_slot_student(self, data_loader) -> Dict:
         """
