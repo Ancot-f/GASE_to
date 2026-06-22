@@ -744,11 +744,9 @@ class GASELearner(BaseLearner):
                         self.evaluate_oracle_with_snapshot_head(self.test_loader, snap_id)
                         self.evaluate_hybrid_snapshot_head(self.test_loader, snap_id)
 
-                if self.default_router == "raw_nll":
-                    from gase.routing.nll_router import CalibratedNLLSlotRouter
-                    r = CalibratedNLLSlotRouter(temperature=1.0, calibrate_nll=False, use_logdet=True)
-                    self._network.backbone.set_nll_router(r)
+                self._apply_default_router_to_backbone()
                 self._eval_router_variants()
+                self._apply_default_router_to_backbone()
                 self._save_metrics_json()
 
     # ==================================================================
@@ -780,6 +778,31 @@ class GASELearner(BaseLearner):
                 self.distill_cache.summary() if self.distill_cache is not None else {}
             ),
         }
+
+    def _build_nll_router_for_name(self, router_name: Optional[str] = None):
+        """Build the router object used by official/diagnostic forward paths."""
+        name = router_name or self.default_router
+        if name in ("raw_nll", "path_raw_nll", "candidate_path_raw_nll", "hybrid_path_raw_nll"):
+            from gase.routing.nll_router import CalibratedNLLSlotRouter
+            return CalibratedNLLSlotRouter(temperature=1.0, calibrate_nll=False, use_logdet=True)
+        if name in ("calib_nll", "calibrated_nll", "calib_prior"):
+            from gase.routing.nll_router import CalibratedNLLSlotRouter
+            return CalibratedNLLSlotRouter(temperature=1.0, calibrate_nll=True, use_logdet=True)
+        if name in ("slot0_penalty", "calib_nll_s0penalty"):
+            from gase.routing.nll_router import CalibratedNLLSlotRouter
+            return CalibratedNLLSlotRouter(
+                temperature=1.0, calibrate_nll=True, use_logdet=True, slot0_penalty=1.0)
+        return None
+
+    def _apply_default_router_to_backbone(self) -> None:
+        """Install the default per-layer router, or clear it for key-distance routing."""
+        router = self._build_nll_router_for_name(self.default_router)
+        self._network.backbone.set_nll_router(router)
+        logging.info("[DefaultRouterState] default_router=%s nll_router=%s",
+                     self.default_router, type(router).__name__ if router is not None else "None")
+        if self.default_router == "path_raw_nll":
+            logging.info("[DefaultRouterState] path_raw_nll requires compute_path_key_slot_logits; "
+                         "plain compute_key_slot_logits remains per-layer raw NLL.")
 
     # ==================================================================
     #  Unimplemented (Phase-3+)
@@ -1528,7 +1551,7 @@ class GASELearner(BaseLearner):
                     best_slot = torch.zeros(B, dtype=torch.long)
                     margin_vals = torch.zeros(B)
                 else:
-                    _, h9 = backbone.extract_layer_chart_feature_and_teacher(inputs_in, first_atlas)
+                    h9, _ = backbone.extract_layer_chart_feature_and_teacher(inputs_in, first_atlas)
                     nll_list, sid_list = [], sorted(slot_states.keys())
                     for sid in sid_list:
                         nll_list.append(router.compute_nll(h9, cs_l9, slot_states[sid]))
@@ -2509,6 +2532,10 @@ class GASELearner(BaseLearner):
     def _eval_with_router(self, data_loader, router_name: str, router) -> Dict:
         """Evaluate PerLayerKey with a specific router, using custom log prefix."""
         backbone = self._network.backbone
+        prev_router = None
+        for lid in self.atlas_layers:
+            prev_router = getattr(backbone.get_block(lid), "nll_router", None)
+            break
         backbone.set_nll_router(router)
 
         # Override log prefix by patching evaluate_key_slot_student
@@ -2540,7 +2567,7 @@ class GASELearner(BaseLearner):
             if "-" in key:
                 logging.info("[%s] %s=%.2f", tag, key, val)
 
-        backbone.set_nll_router(None)
+        backbone.set_nll_router(prev_router)
         return result
 
     def _eval_router_variants(self) -> None:

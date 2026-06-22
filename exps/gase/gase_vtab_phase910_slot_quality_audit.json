@@ -46,7 +46,7 @@
     "distill": {"ridge_lambda": 0.001},
 
     "routing": {
-        "default_router": "raw_nll",
+        "default_router": "path_raw_nll",
         "use_shared_router_basis": true,
         "per_sample": true,
         "use_logdet": true,
@@ -64,6 +64,7 @@
         "chart_ood_dryrun": false,
 
         "diag_max_eval_samples": 512,
+        "official_audit_max_samples": 0,
         "diag_skip_single_slot_heavy": true,
 
         "slot_quality_diag": true,

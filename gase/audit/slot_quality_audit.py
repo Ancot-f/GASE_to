@@ -202,47 +202,78 @@ def audit_no_preds(backbone, data_loader, atlas_layers,
 
 def audit_official_forward(model, data_loader, total_classes: int,
                             diagnostic_raw: float, diagnostic_path: float,
-                            diagnostic_sq_best: float, task_id: int) -> Dict:
+                            diagnostic_sq_best: float, task_id: int,
+                            config: Optional[dict] = None) -> Dict:
     """Compare official CNN evaluation with diagnostic router results."""
     backbone = model._network.backbone if hasattr(model, '_network') else model
     backbone.eval()
     device = next(backbone.parameters()).device
+    config = config or {}
+    default_router = getattr(model, "default_router", "shared_q_dist")
+    max_samples = config.get("official_audit_max_samples", 0)
+
+    prev_router = None
+    for lid in getattr(model, "atlas_layers", []):
+        blk = backbone.get_block(lid)
+        prev_router = getattr(blk, "nll_router", None)
+        break
+
+    router = None
+    if hasattr(model, "_build_nll_router_for_name"):
+        router = model._build_nll_router_for_name(default_router)
+    elif default_router in ("raw_nll", "path_raw_nll"):
+        from gase.routing.nll_router import CalibratedNLLSlotRouter
+        router = CalibratedNLLSlotRouter(temperature=1.0, calibrate_nll=False, use_logdet=True)
 
     all_preds, all_labels = [], []
-    max_samples = 512
     count = 0
-    with torch.no_grad():
-        for bi, (_, inputs, targets) in enumerate(data_loader):
-            if count >= max_samples:
-                break
-            inputs, targets = inputs.to(device), targets.to(device)
-            logits = backbone.compute_key_slot_logits(inputs)[:, :total_classes]
-            all_preds.append(logits.argmax(dim=1).cpu())
-            all_labels.append(targets.cpu())
-            count += inputs.shape[0]
-            if bi == 0:
-                first_preds = logits.argmax(dim=1).cpu()
+
+    backbone.set_nll_router(router)
+    try:
+        with torch.no_grad():
+            for _, inputs, targets in data_loader:
+                if max_samples and count >= max_samples:
+                    break
+                inputs, targets = inputs.to(device), targets.to(device)
+                if default_router == "path_raw_nll":
+                    logits = backbone.compute_path_key_slot_logits(inputs)[:, :total_classes]
+                else:
+                    logits = backbone.compute_key_slot_logits(inputs)[:, :total_classes]
+                all_preds.append(logits.argmax(dim=1).cpu())
+                all_labels.append(targets.cpu())
+                count += inputs.shape[0]
+    finally:
+        backbone.set_nll_router(prev_router)
+
+    if not all_preds:
+        logging.info("[OfficialForwardAudit][WARN] task=%d no samples evaluated", task_id)
+        return {"official_total": 0.0, "samples": 0, "router_mode": default_router}
 
     y_pred = torch.cat(all_preds).numpy()
     y_true = torch.cat(all_labels).numpy()
     official_acc = 100.0 * (y_pred == y_true).sum() / max(len(y_true), 1)
+    expected = diagnostic_path if default_router == "path_raw_nll" else diagnostic_raw
 
-    logging.info("[OfficialForwardAudit] task=%d official_total=%.2f "
+    logging.info("[OfficialForwardAudit] task=%d router_mode=%s samples=%d official_total=%.2f "
                  "diag_raw=%.2f diag_path=%.2f diag_sqbest=%.2f "
-                 "gap_vs_raw=%+.2f gap_vs_path=%+.2f gap_vs_sq=%+.2f",
-                 task_id, official_acc, diagnostic_raw, diagnostic_path,
+                 "gap_vs_raw=%+.2f gap_vs_path=%+.2f gap_vs_sq=%+.2f gap_vs_default=%+.2f",
+                 task_id, default_router, len(y_true), official_acc, diagnostic_raw, diagnostic_path,
                  diagnostic_sq_best,
                  official_acc - diagnostic_raw, official_acc - diagnostic_path,
-                 official_acc - diagnostic_sq_best)
+                 official_acc - diagnostic_sq_best, official_acc - expected)
 
-    if official_acc < diagnostic_raw - 1.0:
-        logging.info("[OfficialForwardAudit][MISMATCH] task=%d official %.2f << diag_raw %.2f; "
-                     "likely different router/mode/known_classes", task_id, official_acc, diagnostic_raw)
+    if abs(official_acc - expected) > 1.0:
+        logging.info("[OfficialForwardAudit][MISMATCH] task=%d router_mode=%s official %.2f vs expected %.2f; "
+                     "likely different router/mode/sample coverage/known_classes",
+                     task_id, default_router, official_acc, expected)
 
     return {"official_total": official_acc,
+            "samples": len(y_true),
+            "router_mode": default_router,
             "gap_vs_raw": official_acc - diagnostic_raw,
             "gap_vs_path": official_acc - diagnostic_path,
-            "gap_vs_sqbest": official_acc - diagnostic_sq_best}
+            "gap_vs_sqbest": official_acc - diagnostic_sq_best,
+            "gap_vs_default": official_acc - expected}
 
 
 def evaluate_slot_quality_baseline_router(backbone, data_loader, atlas_layers,
@@ -436,7 +467,7 @@ def run_slot_quality_audit(model, data_loader, atlas_layers, total_classes: int,
     results["no_preds"] = audit_no_preds(backbone, data_loader, atlas_layers, task_id, config)
     results["official_forward"] = audit_official_forward(
         model, data_loader, total_classes, raw_nll, path_nll,
-        raw_nll, task_id)  # sq_best not ready yet
+        raw_nll, task_id, config=config)  # sq_best not ready yet
     results["baseline_compare"] = run_baseline_compare(
         backbone, data_loader, atlas_layers, total_classes,
         raw_nll, path_nll, candidate_path, oracle, task_id)
