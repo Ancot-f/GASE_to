@@ -136,6 +136,10 @@ class GASELearner(BaseLearner):
 
         self.phase99_diag_results: Optional[Dict] = None
 
+        # Phase-9.10: slot quality audit
+        self.slot_quality_audit: bool = routing_cfg_diag.get("slot_quality_audit", False)
+        self.phase910_audit_results: Optional[Dict] = None
+
         logging.info(
             "GASELearner Phase-2 initialized. atlas_layers=%s, adapter_dim=%d",
             self.atlas_layers, self.adapter_dim,
@@ -655,6 +659,28 @@ class GASELearner(BaseLearner):
                         qp = self.phase99_diag_results.get("slot_quality_prior")
                         quality_prior_best = qp.get("best_result", {}) if qp else None
 
+                # Phase-9.10: slot quality audit
+                if self.slot_quality_audit:
+                    logging.info("[Phase910] SlotQualityAudit starting task=%d...", self._cur_task)
+                    from gase.audit.slot_quality_audit import run_slot_quality_audit
+                    oracle_total = oracle_result.get("top1", 0) if oracle_result else 0
+                    path_total = path_nll_result.get("top1", 0) if path_nll_result else 0
+                    cand_total = cand_path_result.get("top1", 0) if cand_path_result else 0
+                    raw_pre = self._eval_with_router(
+                        self.test_loader, "raw_nll_audit",
+                        CalibratedNLLSlotRouter(temperature=1.0, calibrate_nll=False, use_logdet=True))
+                    raw_total = raw_pre.get("top1", 0) if raw_pre else 0
+                    self.phase910_audit_results = run_slot_quality_audit(
+                        model=self, data_loader=self.test_loader,
+                        atlas_layers=self.atlas_layers, total_classes=self._total_classes,
+                        raw_nll=raw_total, path_nll=path_total,
+                        candidate_path=cand_total, oracle=oracle_total,
+                        task_id=self._cur_task, config={
+                            "diag_max_eval_samples": self.diag_max_eval_samples,
+                            "quality_weight_list": self.quality_weight_list,
+                        })
+                    logging.info("[Phase910] SlotQualityAudit done task=%d", self._cur_task)
+
                 if oracle_result and key_result and path_result:
                     from gase.routing.nll_router import CalibratedNLLSlotRouter
                     r_nll = CalibratedNLLSlotRouter(temperature=1.0, calibrate_nll=False, use_logdet=True)
@@ -1128,6 +1154,10 @@ class GASELearner(BaseLearner):
                         # Convert to serializable form
                         val = self.phase99_diag_results[diag_key]
                         data["slot_router_diag"][diag_key] = GASELearner._safe_serialize(val)
+
+            # Phase-9.10: slot quality audit
+            if self.phase910_audit_results:
+                data["slot_quality_audit"] = GASELearner._safe_serialize(self.phase910_audit_results)
 
             with open(path, "w") as f:
                 json.dump(data, f, indent=2)
