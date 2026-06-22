@@ -1375,59 +1375,33 @@ class GASELearner(BaseLearner):
 
     def evaluate_path_raw_nll_slot_student(self, data_loader) -> Dict:
         """
-        Use raw NLL at L9 to select one slot per sample, then force
-        L9/L10/L11 all to use that same slot (path-consistent).
+        Official path-consistent raw NLL forward.
+
+        PATH_KEY_SLOT_STUDENT lets L9 route with the same prefix used at
+        inference time, then propagates that path slot to L10/L11.
         """
         from gase.routing.nll_router import CalibratedNLLSlotRouter
         backbone = self._network.backbone
         backbone.eval()
         router = CalibratedNLLSlotRouter(temperature=1.0, calibrate_nll=False, use_logdet=True)
+        prev_router = None
+        for lid in self.atlas_layers:
+            prev_router = getattr(backbone.get_block(lid), "nll_router", None)
+            break
 
         all_preds, all_labels_list = [], []
-        first_atlas = min(self.atlas_layers)
-
-        with torch.no_grad():
-            for _, inputs, targets in data_loader:
-                inputs = inputs.to(self._device)
-                B = inputs.shape[0]
-
-                # Get L9 chart and slots for path routing
-                l9_blk = backbone.get_block(first_atlas)
-                available = l9_blk.get_available_slot_ids(0)
-                cs_l9 = l9_blk.chart_states.get(0)
-
-                if not available or cs_l9 is None:
-                    logits = backbone.compute_key_slot_logits(inputs)
-                else:
-                    # Collect slot states
-                    slot_states = {}
-                    for sid in available:
-                        ss = l9_blk.slot_states.get(f"0_{sid}")
-                        if ss is not None:
-                            slot_states[sid] = ss
-
-                    # Extract L9 h_chart for routing
-                    h9 = backbone._extract_h_chart_at_layer(inputs, first_atlas)
-
-                    # Route with raw NLL at L9
-                    routing = router.route(h9, cs_l9, slot_states)
-                    path_slot = routing["slot_ids"]  # [B]
-
-                    # Force-consistent path forward
-                    backbone._clear_path_slot_ids()
-                    for lid in self.atlas_layers:
-                        backbone.blocks[lid].path_slot_id = path_slot
-                    backbone.set_adapter_mode("path_key_slot_student")
-                    try:
-                        out = backbone.forward(inputs)
-                        logits = out["logits"]
-                    finally:
-                        backbone.set_adapter_mode("task_train")
-
-                logits = logits[:, :self._total_classes]
-                topk = torch.topk(logits, k=self.topk, dim=1, largest=True, sorted=True)[1]
-                all_preds.append(topk.cpu().numpy())
-                all_labels_list.append(targets.cpu().numpy())
+        backbone.set_nll_router(router)
+        try:
+            with torch.no_grad():
+                for _, inputs, targets in data_loader:
+                    inputs = inputs.to(self._device)
+                    logits = backbone.compute_path_key_slot_logits(inputs)
+                    logits = logits[:, :self._total_classes]
+                    topk = torch.topk(logits, k=self.topk, dim=1, largest=True, sorted=True)[1]
+                    all_preds.append(topk.cpu().numpy())
+                    all_labels_list.append(targets.cpu().numpy())
+        finally:
+            backbone.set_nll_router(prev_router)
 
         y_pred = np.concatenate(all_preds)
         y_true = np.concatenate(all_labels_list)
@@ -1551,7 +1525,12 @@ class GASELearner(BaseLearner):
                     best_slot = torch.zeros(B, dtype=torch.long)
                     margin_vals = torch.zeros(B)
                 else:
-                    h9, _ = backbone.extract_layer_chart_feature_and_teacher(inputs_in, first_atlas)
+                    prev_mode = backbone.adapter_mode
+                    backbone.set_adapter_mode("path_key_slot_student")
+                    try:
+                        h9 = backbone._extract_h_chart_at_layer(inputs_in, first_atlas)
+                    finally:
+                        backbone.set_adapter_mode(prev_mode)
                     nll_list, sid_list = [], sorted(slot_states.keys())
                     for sid in sid_list:
                         nll_list.append(router.compute_nll(h9, cs_l9, slot_states[sid]))

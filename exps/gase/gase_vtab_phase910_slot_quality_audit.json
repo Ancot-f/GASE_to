@@ -46,7 +46,7 @@
     "distill": {"ridge_lambda": 0.001},
 
     "routing": {
-        "default_router": "path_raw_nll",
+        "default_router": "raw_nll",
         "use_shared_router_basis": true,
         "per_sample": true,
         "use_logdet": true,
