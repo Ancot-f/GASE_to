@@ -65,6 +65,7 @@
 
         "diag_max_eval_samples": 512,
         "official_audit_max_samples": 0,
+        "slot_quality_audit_max_samples": 0,
         "diag_skip_single_slot_heavy": true,
 
         "slot_quality_diag": true,

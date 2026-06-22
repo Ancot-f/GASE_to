@@ -61,63 +61,72 @@ def audit_coverage(backbone, data_loader, atlas_layers, total_classes: int,
     backbone.eval()
     router = CalibratedNLLSlotRouter(temperature=1.0, calibrate_nll=False, use_logdet=True)
     device = next(backbone.parameters()).device
-    max_samples = config.get("diag_max_eval_samples", 512)
+    max_samples = config.get("slot_quality_audit_max_samples", 0)
 
     total = 0
     evaluated = 0
     correct = 0
+    first_atlas = min(atlas_layers)
 
-    for lid in atlas_layers:
-        blk = backbone.get_block(lid)
-        available = blk.get_available_slot_ids(0)
-        cs = blk.chart_states.get(0)
-        if cs is None or len(available) <= 1:
-            continue
-        ss_dict = {sid: blk.slot_states.get(f"0_{sid}")
-                   for sid in available if blk.slot_states.get(f"0_{sid}") is not None}
+    blk = backbone.get_block(first_atlas)
+    available = blk.get_available_slot_ids(0)
+    cs = blk.chart_states.get(0)
+    if cs is None or len(available) <= 1:
+        logging.info("[SlotQualityCoverageAudit] task=%d layer=%d skip=single_slot_or_no_chart",
+                     task_id, first_atlas)
+        return {"total": 0, "evaluated": 0, "coverage": 0.0,
+                "acc_evaluated": 0.0, "acc_missing_as_wrong": 0.0}
 
-        with torch.no_grad():
-            for _, inputs, targets in data_loader:
-                inputs, targets = inputs.to(device), targets.to(device)
-                B = inputs.shape[0]
-                total += B
-                if total > max_samples:
-                    break
+    ss_dict = {sid: blk.slot_states.get(f"0_{sid}")
+               for sid in available if blk.slot_states.get(f"0_{sid}") is not None}
 
-                h = backbone._extract_h_chart_at_layer(inputs, lid)
-                nll_scores = []
-                for sid in available:
-                    ss = ss_dict.get(sid)
-                    if ss is not None:
-                        nll = router.compute_nll(h, cs, ss)
-                        nll_scores.append(-nll)
-                    else:
-                        nll_scores.append(torch.full([B], -float("inf"), device=device))
+    with torch.no_grad():
+        for _, inputs, targets in data_loader:
+            if max_samples and evaluated >= max_samples:
+                break
+            inputs, targets = inputs.to(device), targets.to(device)
+            B = inputs.shape[0]
+            if max_samples:
+                keep = min(B, max_samples - evaluated)
+                inputs, targets = inputs[:keep], targets[:keep]
+                B = keep
+            total += B
 
-                scores = torch.stack(nll_scores, dim=1)
-                best_slot = torch.tensor([available[i.item()] for i in scores.argmax(dim=1)],
-                                        device=device, dtype=torch.long)
+            h = backbone._extract_h_chart_at_layer(inputs, first_atlas)
+            nll_scores = []
+            for sid in available:
+                ss = ss_dict.get(sid)
+                if ss is not None:
+                    nll = router.compute_nll(h, cs, ss)
+                    nll_scores.append(-nll)
+                else:
+                    nll_scores.append(torch.full([B], -float("inf"), device=device))
 
-                backbone._clear_path_slot_ids()
-                for l2 in atlas_layers:
-                    backbone.blocks[l2].path_slot_id = best_slot
-                backbone.set_adapter_mode("path_key_slot_student")
-                try:
-                    logits = backbone.forward(inputs)["logits"][:, :total_classes]
-                finally:
-                    backbone.set_adapter_mode("task_train")
+            scores = torch.stack(nll_scores, dim=1)
+            best_slot = torch.tensor([available[i.item()] for i in scores.argmax(dim=1)],
+                                    device=device, dtype=torch.long)
 
-                preds = logits.argmax(dim=1)
-                evaluated += B
-                correct += int((preds == targets).sum())
+            backbone._clear_path_slot_ids()
+            for l2 in atlas_layers:
+                backbone.blocks[l2].path_slot_id = best_slot
+            backbone.set_adapter_mode("path_key_slot_student")
+            try:
+                logits = backbone.forward(inputs)["logits"][:, :total_classes]
+            finally:
+                backbone.set_adapter_mode("task_train")
+
+            preds = logits.argmax(dim=1)
+            evaluated += B
+            correct += int((preds == targets).sum())
 
     acc_evaluated = 100.0 * correct / max(evaluated, 1)
     acc_missing_as_wrong = 100.0 * correct / max(total, 1)
     coverage = evaluated / max(total, 1)
 
-    logging.info("[SlotQualityCoverageAudit] task=%d total=%d evaluated=%d coverage=%.4f "
+    logging.info("[SlotQualityCoverageAudit] task=%d layer=%d max_samples=%s total=%d evaluated=%d coverage=%.4f "
                  "acc_evaluated=%.2f acc_missing_as_wrong=%.2f",
-                 task_id, total, evaluated, coverage, acc_evaluated, acc_missing_as_wrong)
+                 task_id, first_atlas, max_samples if max_samples else "full",
+                 total, evaluated, coverage, acc_evaluated, acc_missing_as_wrong)
     if coverage < 0.99:
         logging.info("[SlotQualityCoverageAudit][WARN] task=%d coverage=%.4f < 0.99; "
                      "reported accuracy may be inflated", task_id, coverage)
@@ -277,7 +286,8 @@ def audit_official_forward(model, data_loader, total_classes: int,
 
 
 def evaluate_slot_quality_baseline_router(backbone, data_loader, atlas_layers,
-                                           total_classes: int, task_id: int) -> Dict:
+                                           total_classes: int, task_id: int,
+                                           config: Optional[dict] = None) -> Dict:
     """Reproduce SlotQualityPriorEval weight=0.00 as a named diagnostic router.
 
     This is the reproducible version: per-layer raw NLL path-consistent routing.
@@ -287,17 +297,22 @@ def evaluate_slot_quality_baseline_router(backbone, data_loader, atlas_layers,
     backbone.eval()
     router = CalibratedNLLSlotRouter(temperature=1.0, calibrate_nll=False, use_logdet=True)
     device = next(backbone.parameters()).device
+    config = config or {}
 
     all_preds, all_labels = [], []
     count = 0
-    max_samples = 512
+    max_samples = config.get("slot_quality_audit_max_samples", 0)
 
     with torch.no_grad():
         for _, inputs, targets in data_loader:
-            if count >= max_samples:
+            if max_samples and count >= max_samples:
                 break
             inputs, targets = inputs.to(device), targets.to(device)
             B = inputs.shape[0]
+            if max_samples:
+                keep = min(B, max_samples - count)
+                inputs, targets = inputs[:keep], targets[:keep]
+                B = keep
             count += B
 
             # Per-layer: for each atlas layer, find best slot by raw NLL
@@ -348,8 +363,9 @@ def evaluate_slot_quality_baseline_router(backbone, data_loader, atlas_layers,
     y_true = np.concatenate(all_labels)
     acc = 100.0 * (y_pred == y_true).sum() / max(len(y_true), 1)
 
-    logging.info("[SlotQualityBaselineRouter] task=%d total=%.2f", task_id, acc)
-    return {"top1": acc}
+    logging.info("[SlotQualityBaselineRouter] task=%d samples=%d max_samples=%s total=%.2f",
+                 task_id, len(y_true), max_samples if max_samples else "full", acc)
+    return {"top1": acc, "samples": len(y_true)}
 
 
 # ============================================================================
@@ -358,11 +374,12 @@ def evaluate_slot_quality_baseline_router(backbone, data_loader, atlas_layers,
 
 def run_baseline_compare(backbone, data_loader, atlas_layers, total_classes: int,
                           raw_nll: float, path_nll: float, candidate_path: float,
-                          oracle: float, task_id: int) -> Dict:
+                          oracle: float, task_id: int, config: Optional[dict] = None) -> Dict:
     """Compare all routers and log histograms."""
+    config = config or {}
 
     sq_best = evaluate_slot_quality_baseline_router(backbone, data_loader, atlas_layers,
-                                                      total_classes, task_id)
+                                                      total_classes, task_id, config=config)
     sq_total = sq_best["top1"]
 
     logging.info("[SlotQualityBaselineCompare] task=%d raw=%.2f path=%.2f cand_path=%.2f "
@@ -470,7 +487,7 @@ def run_slot_quality_audit(model, data_loader, atlas_layers, total_classes: int,
         raw_nll, task_id, config=config)  # sq_best not ready yet
     results["baseline_compare"] = run_baseline_compare(
         backbone, data_loader, atlas_layers, total_classes,
-        raw_nll, path_nll, candidate_path, oracle, task_id)
+        raw_nll, path_nll, candidate_path, oracle, task_id, config=config)
 
     sq_total = results["baseline_compare"]["sq_top1"]
     coverage_ok = results["coverage"].get("coverage", 0) >= 0.99
