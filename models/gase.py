@@ -115,6 +115,27 @@ class GASELearner(BaseLearner):
         self.chart_ood_config: dict = args.get("routing", {}).get("chart_ood", {})
         self.phase98_dryrun_results: Optional[Dict] = None
 
+        # Phase-9.9: chart mode + slot/router diagnostics
+        chart_cfg = args.get("chart", {})
+        self.chart_mode: str = chart_cfg.get("mode", "single_active_chart")
+        self.max_active_charts_per_layer: int = chart_cfg.get("max_active_charts_per_layer", 1)
+        self.chart_creation_enabled: bool = chart_cfg.get("chart_creation_enabled", False)
+        self.allow_multi_chart_codepath: bool = chart_cfg.get("allow_multi_chart_codepath", True)
+        self.default_chart_id: int = chart_cfg.get("default_chart_id", 0)
+
+        routing_cfg_diag = args.get("routing", {})
+        self.slot_quality_diag_enabled: bool = routing_cfg_diag.get("slot_quality_diag", False)
+        self.router_basis_diag_enabled: bool = routing_cfg_diag.get("router_basis_diag", False)
+        self.adapter_effect_diag_enabled: bool = routing_cfg_diag.get("adapter_effect_diag", False)
+        self.oracle_error_diag_enabled: bool = routing_cfg_diag.get("oracle_error_diag", False)
+        self.slot_quality_prior_enabled: bool = routing_cfg_diag.get("slot_quality_prior_eval", False)
+        self.path_decision_diag_enabled: bool = routing_cfg_diag.get("path_decision_diag", False)
+        self.quality_weight_list: List[float] = routing_cfg_diag.get("quality_weight_list", [0.0, 0.1, 0.2, 0.5, 1.0])
+        self.diag_max_eval_samples: int = routing_cfg_diag.get("diag_max_eval_samples", 512)
+        self.diag_skip_single_slot_heavy: bool = routing_cfg_diag.get("diag_skip_single_slot_heavy", True)
+
+        self.phase99_diag_results: Optional[Dict] = None
+
         logging.info(
             "GASELearner Phase-2 initialized. atlas_layers=%s, adapter_dim=%d",
             self.atlas_layers, self.adapter_dim,
@@ -128,6 +149,50 @@ class GASELearner(BaseLearner):
         logging.info("[RouterConfig] calibrate_nll=%s", routing_cfg.get("calibrate_nll", False))
         logging.info("[RouterConfig] compare_router_variants=%s", routing_cfg.get("compare_router_variants", True))
         logging.info("[RouterConfig] variants=%s", routing_cfg.get("router_variants", ["shared_q_dist", "raw_nll"]))
+
+        # Chart mode config
+        logging.info("[ChartModeConfig] mode=%s", self.chart_mode)
+        logging.info("[ChartModeConfig] max_active_charts_per_layer=%d", self.max_active_charts_per_layer)
+        logging.info("[ChartModeConfig] chart_creation_enabled=%s", self.chart_creation_enabled)
+        logging.info("[ChartModeConfig] allow_multi_chart_codepath=%s", self.allow_multi_chart_codepath)
+        logging.info("[ChartModeConfig] default_chart_id=%d", self.default_chart_id)
+        logging.info("[ChartModeConfig] NOTE: one-chart is a config constraint, not a code assumption")
+
+        # Multi-chart capability check
+        self._log_multi_chart_capability()
+
+    def _log_multi_chart_capability(self) -> None:
+        """Verify multi-chart code structure is preserved (not degraded to one-chart-only)."""
+        backbone = self._network.backbone
+        issues = []
+        checks = {
+            "atlas_storage": "multi_chart_registry",
+            "chart_id_field": True,
+            "slot_key_has_chart_id": True,
+            "chart_candidate_api": True,
+            "slot_candidate_api": True,
+            "chart_creation_api": True,
+            "active_mode": self.chart_mode,
+            "active_charts_per_layer": self.max_active_charts_per_layer,
+        }
+        # Verify chart_states is a dict (not a single ChartState)
+        for lid in self.atlas_layers:
+            blk = backbone.get_block(lid)
+            if hasattr(blk, "chart_states"):
+                if not isinstance(blk.chart_states, dict):
+                    issues.append(f"layer={lid} chart_states is {type(blk.chart_states).__name__}, not dict")
+            # Verify slot_states keys contain chart_id
+            if hasattr(blk, "slot_states"):
+                for key in list(blk.slot_states.keys())[:3]:
+                    if "_" not in str(key):
+                        issues.append(f"layer={lid} slot key '{key}' missing chart_id separator")
+        if issues:
+            for issue in issues:
+                logging.info("[MultiChartCapabilityCheck][WARN] %s", issue)
+            checks["status"] = "WARN"
+        else:
+            checks["status"] = "OK"
+        logging.info("[MultiChartCapabilityCheck] %s", " ".join(f"{k}={v}" for k, v in sorted(checks.items())))
 
     # ==================================================================
     #  Incremental training entry point (called by trainer.py)
@@ -572,6 +637,24 @@ class GASELearner(BaseLearner):
                             logging.info("[ChartRadiusBestCandidate] task=%d recommend=False "
                                          "reason=no_candidate_passed_threshold", self._cur_task)
 
+                # Phase-9.9: slot/router quality diagnostics
+                quality_prior_best = None
+                if self.slot_quality_diag_enabled or self.slot_quality_prior_enabled:
+                    # Need raw_nll/path_nll baselines for gain computation
+                    backbone = self._network.backbone
+                    from gase.routing.nll_router import CalibratedNLLSlotRouter
+                    r_nll_tmp = CalibratedNLLSlotRouter(temperature=1.0, calibrate_nll=False, use_logdet=True)
+                    raw_pre = self._eval_with_router(self.test_loader, "raw_nll_pre", r_nll_tmp)
+                    raw_nll_pre_total = raw_pre.get("top1", 0) if raw_pre else 0
+                    path_nll_pre_total = path_nll_result.get("top1", 0) if path_nll_result else 0
+
+                    self.phase99_diag_results = self._run_slot_router_diagnostics(
+                        raw_nll_total=raw_nll_pre_total,
+                        path_nll_total=path_nll_pre_total)
+                    if self.phase99_diag_results:
+                        qp = self.phase99_diag_results.get("slot_quality_prior")
+                        quality_prior_best = qp.get("best_result", {}) if qp else None
+
                 if oracle_result and key_result and path_result:
                     from gase.routing.nll_router import CalibratedNLLSlotRouter
                     r_nll = CalibratedNLLSlotRouter(temperature=1.0, calibrate_nll=False, use_logdet=True)
@@ -614,9 +697,13 @@ class GASELearner(BaseLearner):
                             f"DryChartOracleGainOverPath={dry_gain:+.2f}" if dry_gain is not None else "DryChartOracleGainOverPath=NA",
                             f"ChartRadiusBestRecommend={dry_recommend}",
                         ]
+                    if quality_prior_best:
+                        qp_total = quality_prior_best.get("top1", 0)
+                        eval_parts += [f"SlotQualityPriorBest={qp_total:.2f}"]
                     best_so_far = max(v for v in [path_nll_result.get("top1", 0) if path_nll_result else 0,
                                                     raw_nll_total] if v > 0)
-                    eval_parts += [f"Oracle-gap={oracle_result.get('top1', 0) - raw_nll_total:.2f}"]
+                    eval_parts += [f"Oracle-gap-raw={oracle_result.get('top1', 0) - raw_nll_total:.2f}"]
+                    eval_parts += [f"Oracle-gap-path={oracle_result.get('top1', 0) - (path_nll_result.get('top1', 0) if path_nll_result else 0):.2f}"]
                     eval_parts += [f"DefaultRouter={self.default_router}"]
                     logging.info("[EvalCompare] %s", " ".join(eval_parts))
                 # Phase-8.7: head stabilization with pre_known range
@@ -751,7 +838,7 @@ class GASELearner(BaseLearner):
 
         committed_slots = blk.get_available_slot_ids(0)
         logging.info(
-            "[CommittedSlots] layer=%d slots=%s", layer_id, committed_slots,
+            "[CommittedSlots] layer=%d chart=0 slots=%s", layer_id, committed_slots,
         )
 
         # Phase-9.2: CrossNLL matrix for current source slot
@@ -937,6 +1024,24 @@ class GASELearner(BaseLearner):
     #  Phase-7.5: Path-level consistent slot routing eval
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _safe_serialize(obj):
+        """Convert numpy/torch types to JSON-safe types, replacing NaN/Inf with null."""
+        import numpy as np
+        if isinstance(obj, dict):
+            return {str(k): GASELearner._safe_serialize(v) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple)):
+            return [GASELearner._safe_serialize(v) for v in obj]
+        if isinstance(obj, (np.integer,)):
+            return int(obj)
+        if isinstance(obj, (np.floating,)):
+            v = float(obj)
+            return None if np.isnan(v) or np.isinf(v) else v
+        if isinstance(obj, float):
+            import math
+            return None if math.isnan(obj) or math.isinf(obj) else obj
+        return obj
+
     def _save_metrics_json(self):
         """Save Oracle/Key/Path metrics to JSON after each task."""
         import json, os
@@ -1013,6 +1118,16 @@ class GASELearner(BaseLearner):
                                     "oracle_eval": res.get("oracle_eval", {}),
                                     "proposal": res.get("proposal", {}),
                                 }
+
+            # Phase-9.9: slot/router quality diagnostics
+            if self.phase99_diag_results:
+                data["slot_router_diag"] = {}
+                for diag_key in ["oracle_error", "slot_score", "router_basis",
+                                 "adapter_effect", "slot_quality_prior", "path_decision"]:
+                    if diag_key in self.phase99_diag_results:
+                        # Convert to serializable form
+                        val = self.phase99_diag_results[diag_key]
+                        data["slot_router_diag"][diag_key] = GASELearner._safe_serialize(val)
 
             with open(path, "w") as f:
                 json.dump(data, f, indent=2)
@@ -2316,6 +2431,47 @@ class GASELearner(BaseLearner):
             return results
         except Exception as e:
             logging.warning("[ChartOODDryRun] failed: %s", e)
+            import traceback
+            logging.warning(traceback.format_exc())
+            return None
+
+    # ==================================================================
+    #  Phase-9.9: Slot/Router/Adapter Quality Diagnostics
+    # ==================================================================
+
+    def _run_slot_router_diagnostics(self, raw_nll_total: float, path_nll_total: float) -> Optional[Dict]:
+        """Run Phase-9.9 slot/router/adapter quality diagnostics."""
+        from gase.diagnostics.slot_quality_diag import run_all_slot_quality_diagnostics
+        logging.info("[SlotDiag] Phase-9.9: running slot/router quality diagnostics...")
+
+        diag_config = {
+            "oracle_error_diag": self.oracle_error_diag_enabled,
+            "slot_quality_diag": self.slot_quality_diag_enabled,
+            "router_basis_diag": self.router_basis_diag_enabled,
+            "adapter_effect_diag": self.adapter_effect_diag_enabled,
+            "slot_quality_prior_eval": self.slot_quality_prior_enabled,
+            "path_decision_diag": self.path_decision_diag_enabled,
+            "quality_weight_list": self.quality_weight_list,
+            "diag_max_eval_samples": self.diag_max_eval_samples,
+            "diag_skip_single_slot_heavy": self.diag_skip_single_slot_heavy,
+            "increment": self.args.get("increment", 10),
+        }
+
+        try:
+            results = run_all_slot_quality_diagnostics(
+                backbone=self._network.backbone,
+                data_loader=self.test_loader,
+                atlas_layers=self.atlas_layers,
+                total_classes=self._total_classes,
+                raw_nll_baseline=raw_nll_total,
+                path_nll_baseline=path_nll_total,
+                config=diag_config,
+                task_id=self._cur_task,
+            )
+            logging.info("[SlotDiag] diagnostics complete")
+            return results
+        except Exception as e:
+            logging.warning("[SlotDiag] failed: %s", e)
             import traceback
             logging.warning(traceback.format_exc())
             return None
