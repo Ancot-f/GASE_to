@@ -678,6 +678,14 @@ class GASELearner(BaseLearner):
                         task_id=self._cur_task, config={
                             "diag_max_eval_samples": self.diag_max_eval_samples,
                             "quality_weight_list": self.quality_weight_list,
+                            "official_audit_max_samples": self.args.get("routing", {}).get(
+                                "official_audit_max_samples", 0),
+                            "slot_quality_audit_max_samples": self.args.get("routing", {}).get(
+                                "slot_quality_audit_max_samples", 0),
+                            "slot_quality_prefix_mode": self.args.get("routing", {}).get(
+                                "slot_quality_prefix_mode", "path_key_slot_student"),
+                            "audit_compare_current_prefix": self.args.get("routing", {}).get(
+                                "audit_compare_current_prefix", True),
                         })
                     logging.info("[Phase910] SlotQualityAudit done task=%d", self._cur_task)
 
@@ -1077,6 +1085,8 @@ class GASELearner(BaseLearner):
     def _safe_serialize(obj):
         """Convert numpy/torch types to JSON-safe types, replacing NaN/Inf with null."""
         import numpy as np
+        if isinstance(obj, (bool, np.bool_)):
+            return bool(obj)
         if isinstance(obj, dict):
             return {str(k): GASELearner._safe_serialize(v) for k, v in obj.items()}
         if isinstance(obj, (list, tuple)):
@@ -2595,6 +2605,10 @@ class GASELearner(BaseLearner):
         path_nll_total = self.phase6_path_nll_eval.get("top1", 0) if self.phase6_path_nll_eval else 0
         cand_path_total = self.phase6_cand_path_eval.get("top1", 0) if self.phase6_cand_path_eval else 0
         hybrid_total = self.phase6_hybrid_eval.get("top1", 0) if self.phase6_hybrid_eval else 0
+        sq_deploy_total = None
+        if self.phase910_audit_results:
+            baseline_compare = self.phase910_audit_results.get("baseline_compare", {})
+            sq_deploy_total = baseline_compare.get("sq_deploy_top1")
 
         # Phase-9.6: path gate variants
         cm_total = self.phase96_cand_margin_eval.get("best_result", {}).get("top1", 0) if self.phase96_cand_margin_eval else 0
@@ -2626,6 +2640,8 @@ class GASELearner(BaseLearner):
         # Build total line dynamically
         parts = [f"dist={r_dist:.2f}", f"raw_nll={nll_result.get('top1', 0):.2f}",
                  f"path_nll={path_nll_total:.2f}", f"cand_path={cand_path_total:.2f}"]
+        if sq_deploy_total is not None:
+            parts += [f"slot_quality_deploy={sq_deploy_total:.2f}"]
         if self.path_score_eval and bz_total is not None:
             parts += [f"balanced_z={bz_total:.2f}", f"percentile_path={perc_total:.2f}",
                       f"percentile_s0p={ps0p_total:.2f}"]
@@ -2644,6 +2660,8 @@ class GASELearner(BaseLearner):
             "candidate_path_raw_nll": cand_path_total,
             "hybrid_path_raw_nll": hybrid_total,
         }
+        if sq_deploy_total is not None:
+            scores["slot_quality_deploy"] = sq_deploy_total
         if self.path_gate_eval:
             scores.update({
                 "candidate_margin_hybrid": cm_total,
@@ -2661,6 +2679,7 @@ class GASELearner(BaseLearner):
         # Separate credible routers from diagnostic-only
         credible_keys = {"shared_q_dist", "raw_nll", "calib_nll", "calib_prior", "slot0_penalty",
                          "path_raw_nll", "candidate_path_raw_nll", "hybrid_path_raw_nll",
+                         "slot_quality_deploy",
                          "candidate_margin_hybrid", "layer_agreement_hybrid",
                          "candidate_agreement_hybrid", "balanced_z", "percentile_path", "percentile_s0p"}
         credible_scores = {k: v for k, v in scores.items() if k in credible_keys and v is not None}
