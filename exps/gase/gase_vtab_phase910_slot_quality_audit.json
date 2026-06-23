@@ -40,7 +40,13 @@
         "chart_selection_mode": "single_active",
         "default_chart_id": 0
     },
-    "slot": {"input_rank": 8, "output_rank": 4, "max_slots_per_chart": 10},
+    "slot": {
+        "input_rank": 8,
+        "output_rank": 4,
+        "max_slots_per_chart": 10,
+        "router_num_prototypes": 4,
+        "router_kmeans_iters": 8
+    },
     "chart_adapter": {"type": "linear"},
     "free_adapter": {"enabled": true, "bottleneck_dim": 16, "dropout": 0.0, "scale": 1.0, "epochs": 3, "lr": 0.001},
     "distill": {"ridge_lambda": 0.001},
@@ -68,6 +74,12 @@
         "slot_quality_audit_max_samples": 0,
         "slot_quality_prefix_mode": "path_key_slot_student",
         "audit_compare_current_prefix": true,
+        "audit_prototype_router": true,
+        "prototype_top_m": 3,
+        "prototype_temperature": 1.0,
+        "prototype_use_logdet": true,
+        "prototype_use_prior": true,
+        "prototype_aggregate": "logsumexp",
         "diag_skip_single_slot_heavy": true,
 
         "slot_quality_diag": true,

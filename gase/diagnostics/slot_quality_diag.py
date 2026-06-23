@@ -258,6 +258,9 @@ def compute_slot_quality_prior_eval(backbone, data_loader, atlas_layers,
     router = CalibratedNLLSlotRouter(temperature=1.0, calibrate_nll=False, use_logdet=True)
     device = next(backbone.parameters()).device
     results = {}
+    prefix_mode = getattr(backbone, "adapter_mode", "unknown")
+    logging.info("[SlotQualityPriorEval][DIAGNOSTIC_ONLY] task=%d prefix_mode=current actual_prefix_mode=%s "
+                 "deploy_score_is_reported_by_Phase910_audit", task_id, prefix_mode)
 
     for lid in atlas_layers:
         blk = backbone.get_block(lid)
@@ -291,6 +294,7 @@ def compute_slot_quality_prior_eval(backbone, data_loader, atlas_layers,
                     best_slot = torch.tensor([available[i.item()] for i in scores.argmax(dim=1)],
                                             device=device, dtype=torch.long)
 
+                    prev_mode = getattr(backbone, "adapter_mode", None)
                     backbone._clear_path_slot_ids()
                     for l2 in atlas_layers:
                         backbone.blocks[l2].path_slot_id = best_slot
@@ -298,7 +302,9 @@ def compute_slot_quality_prior_eval(backbone, data_loader, atlas_layers,
                     try:
                         logits = backbone.forward(inputs)["logits"][:, :total_classes]
                     finally:
-                        backbone.set_adapter_mode("task_train")
+                        backbone._clear_path_slot_ids()
+                        if prev_mode is not None:
+                            backbone.set_adapter_mode(prev_mode)
                     all_preds.append(torch.topk(logits, k=1, dim=1)[1].cpu().numpy())
                     all_labels.append(targets.cpu().numpy())
 
@@ -313,8 +319,11 @@ def compute_slot_quality_prior_eval(backbone, data_loader, atlas_layers,
             if y_pred.ndim == 2:
                 y_pred = y_pred[:, 0]
             acc = 100.0 * (y_pred == y_true).sum() / max(len(y_true), 1)
-            results[lid][w] = {"top1": acc}
-            logging.info("[SlotQualityPriorEval] task=%d layer=%d weight=%.2f total=%.2f", task_id, lid, w, acc)
+            results[lid][w] = {"top1": acc, "diagnostic_only": True,
+                               "prefix_mode": "current",
+                               "actual_prefix_mode": prefix_mode}
+            logging.info("[SlotQualityPriorEval][DIAG_CURRENT] task=%d layer=%d weight=%.2f total=%.2f",
+                         task_id, lid, w, acc)
 
     best_w, best_acc = None, 0.0
     for lid, lr in results.items():
@@ -324,12 +333,16 @@ def compute_slot_quality_prior_eval(backbone, data_loader, atlas_layers,
                 best_w = w
 
     if best_w is not None:
-        logging.info("[SlotQualityPriorBest] task=%d best_weight=%.2f total=%.2f gain_raw=%+.2f gain_path=%+.2f",
+        logging.info("[SlotQualityPriorBest][DIAG_CURRENT] task=%d best_weight=%.2f total=%.2f "
+                     "gain_raw=%+.2f gain_path=%+.2f",
                      task_id, best_w, best_acc, best_acc - raw_nll_baseline, best_acc - path_nll_baseline)
     else:
-        logging.info("[SlotQualityPriorBest] task=%d no_valid_results", task_id)
+        logging.info("[SlotQualityPriorBest][DIAG_CURRENT] task=%d no_valid_results", task_id)
 
-    return {"sweep": results, "best_weight": best_w, "best_result": {"top1": best_acc}}
+    return {"sweep": results, "best_weight": best_w,
+            "best_result": {"top1": best_acc, "diagnostic_only": True,
+                            "prefix_mode": "current",
+                            "actual_prefix_mode": prefix_mode}}
 
 
 def compute_path_decision_diag(backbone, data_loader, atlas_layers,

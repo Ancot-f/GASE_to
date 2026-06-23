@@ -686,6 +686,18 @@ class GASELearner(BaseLearner):
                                 "slot_quality_prefix_mode", "path_key_slot_student"),
                             "audit_compare_current_prefix": self.args.get("routing", {}).get(
                                 "audit_compare_current_prefix", True),
+                            "audit_prototype_router": self.args.get("routing", {}).get(
+                                "audit_prototype_router", True),
+                            "prototype_top_m": self.args.get("routing", {}).get(
+                                "prototype_top_m", 3),
+                            "prototype_temperature": self.args.get("routing", {}).get(
+                                "prototype_temperature", 1.0),
+                            "prototype_use_logdet": self.args.get("routing", {}).get(
+                                "prototype_use_logdet", True),
+                            "prototype_use_prior": self.args.get("routing", {}).get(
+                                "prototype_use_prior", True),
+                            "prototype_aggregate": self.args.get("routing", {}).get(
+                                "prototype_aggregate", "logsumexp"),
                         })
                     logging.info("[Phase910] SlotQualityAudit done task=%d", self._cur_task)
 
@@ -733,7 +745,18 @@ class GASELearner(BaseLearner):
                         ]
                     if quality_prior_best:
                         qp_total = quality_prior_best.get("top1", 0)
-                        eval_parts += [f"SlotQualityPriorBest={qp_total:.2f}"]
+                        eval_parts += [f"SlotQualityPriorDiagCurrent={qp_total:.2f}"]
+                    if self.phase910_audit_results:
+                        bc = self.phase910_audit_results.get("baseline_compare", {})
+                        sq_deploy = bc.get("sq_deploy_top1")
+                        sq_current = bc.get("sq_current_top1")
+                        if sq_deploy is not None:
+                            eval_parts += [f"SlotQualityDeploy={sq_deploy:.2f}"]
+                        if sq_current is not None:
+                            eval_parts += [f"SlotQualityCurrentDiag={sq_current:.2f}"]
+                        proto_path = bc.get("prototype_path")
+                        if proto_path and proto_path.get("top1") is not None:
+                            eval_parts += [f"PrototypePath={proto_path.get('top1', 0):.2f}"]
                     best_so_far = max(v for v in [path_nll_result.get("top1", 0) if path_nll_result else 0,
                                                     raw_nll_total] if v > 0)
                     eval_parts += [f"Oracle-gap-raw={oracle_result.get('top1', 0) - raw_nll_total:.2f}"]
@@ -2606,9 +2629,13 @@ class GASELearner(BaseLearner):
         cand_path_total = self.phase6_cand_path_eval.get("top1", 0) if self.phase6_cand_path_eval else 0
         hybrid_total = self.phase6_hybrid_eval.get("top1", 0) if self.phase6_hybrid_eval else 0
         sq_deploy_total = None
+        proto_path_total = None
         if self.phase910_audit_results:
             baseline_compare = self.phase910_audit_results.get("baseline_compare", {})
             sq_deploy_total = baseline_compare.get("sq_deploy_top1")
+            proto_path = baseline_compare.get("prototype_path")
+            if isinstance(proto_path, dict):
+                proto_path_total = proto_path.get("top1")
 
         # Phase-9.6: path gate variants
         cm_total = self.phase96_cand_margin_eval.get("best_result", {}).get("top1", 0) if self.phase96_cand_margin_eval else 0
@@ -2642,6 +2669,8 @@ class GASELearner(BaseLearner):
                  f"path_nll={path_nll_total:.2f}", f"cand_path={cand_path_total:.2f}"]
         if sq_deploy_total is not None:
             parts += [f"slot_quality_deploy={sq_deploy_total:.2f}"]
+        if proto_path_total is not None:
+            parts += [f"prototype_path={proto_path_total:.2f}"]
         if self.path_score_eval and bz_total is not None:
             parts += [f"balanced_z={bz_total:.2f}", f"percentile_path={perc_total:.2f}",
                       f"percentile_s0p={ps0p_total:.2f}"]
@@ -2662,6 +2691,8 @@ class GASELearner(BaseLearner):
         }
         if sq_deploy_total is not None:
             scores["slot_quality_deploy"] = sq_deploy_total
+        if proto_path_total is not None:
+            scores["prototype_path"] = proto_path_total
         if self.path_gate_eval:
             scores.update({
                 "candidate_margin_hybrid": cm_total,
@@ -2679,7 +2710,7 @@ class GASELearner(BaseLearner):
         # Separate credible routers from diagnostic-only
         credible_keys = {"shared_q_dist", "raw_nll", "calib_nll", "calib_prior", "slot0_penalty",
                          "path_raw_nll", "candidate_path_raw_nll", "hybrid_path_raw_nll",
-                         "slot_quality_deploy",
+                         "slot_quality_deploy", "prototype_path",
                          "candidate_margin_hybrid", "layer_agreement_hybrid",
                          "candidate_agreement_hybrid", "balanced_z", "percentile_path", "percentile_s0p"}
         credible_scores = {k: v for k, v in scores.items() if k in credible_keys and v is not None}

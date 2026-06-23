@@ -386,6 +386,87 @@ def evaluate_slot_quality_baseline_router(backbone, data_loader, atlas_layers,
             "prefix_mode": prefix_mode, "actual_prefix_mode": actual_prefix_mode}
 
 
+def evaluate_prototype_path_router(backbone, data_loader, atlas_layers,
+                                    total_classes: int, task_id: int,
+                                    config: Optional[dict] = None) -> Dict:
+    """Evaluate deploy-prefix L9 multi-prototype routing with path-forced slots."""
+    from gase.routing.prototype_router import PrototypeNLLSlotRouter
+
+    backbone.eval()
+    config = config or {}
+    device = next(backbone.parameters()).device
+    first_atlas = min(atlas_layers)
+    prefix_mode = config.get("slot_quality_prefix_mode", "path_key_slot_student")
+    max_samples = config.get("slot_quality_audit_max_samples", 0)
+    router = PrototypeNLLSlotRouter(
+        temperature=config.get("prototype_temperature", 1.0),
+        use_logdet=config.get("prototype_use_logdet", True),
+        use_proto_prior=config.get("prototype_use_prior", True),
+        aggregate=config.get("prototype_aggregate", "logsumexp"),
+    )
+
+    all_preds, all_labels = [], []
+    slot_hist = {}
+    count = 0
+    actual_prefix_mode = prefix_mode
+
+    with torch.no_grad():
+        for _, inputs, targets in data_loader:
+            if max_samples and count >= max_samples:
+                break
+            inputs, targets = inputs.to(device), targets.to(device)
+            B = inputs.shape[0]
+            if max_samples:
+                keep = min(B, max_samples - count)
+                inputs, targets = inputs[:keep], targets[:keep]
+                B = keep
+            count += B
+
+            blk = backbone.get_block(first_atlas)
+            available = blk.get_available_slot_ids(0)
+            cs = blk.chart_states.get(0)
+            ss_dict = {sid: blk.slot_states.get(f"0_{sid}")
+                       for sid in available if blk.slot_states.get(f"0_{sid}") is not None}
+            if cs is None or len(ss_dict) <= 1:
+                selected = torch.zeros(B, dtype=torch.long, device=device)
+            else:
+                h, actual_prefix_mode = _extract_h_with_prefix(backbone, inputs, first_atlas, prefix_mode)
+                selected = router.route(h, cs, ss_dict)["slot_ids"]
+
+            for s in selected.unique().tolist():
+                slot_hist[int(s)] = slot_hist.get(int(s), 0) + int((selected == s).sum())
+
+            prev_mode = getattr(backbone, "adapter_mode", None)
+            backbone._clear_path_slot_ids()
+            for lid in atlas_layers:
+                backbone.blocks[lid].path_slot_id = selected
+            backbone.set_adapter_mode("path_key_slot_student")
+            try:
+                logits = backbone.forward(inputs)["logits"][:, :total_classes]
+            finally:
+                backbone._clear_path_slot_ids()
+                if prev_mode is not None:
+                    backbone.set_adapter_mode(prev_mode)
+
+            all_preds.append(logits.argmax(dim=1).cpu().numpy())
+            all_labels.append(targets.cpu().numpy())
+
+    if not all_preds:
+        logging.info("[PrototypePathRouter][WARN] task=%d no samples evaluated", task_id)
+        return {"top1": 0.0, "samples": 0, "slot_hist": slot_hist,
+                "prefix_mode": prefix_mode, "actual_prefix_mode": actual_prefix_mode}
+
+    y_pred = np.concatenate(all_preds)
+    y_true = np.concatenate(all_labels)
+    acc = 100.0 * (y_pred == y_true).sum() / max(len(y_true), 1)
+    logging.info("[PrototypePathRouter] task=%d prefix_mode=%s actual_prefix_mode=%s "
+                 "samples=%d max_samples=%s total=%.2f slot_hist=%s",
+                 task_id, prefix_mode, actual_prefix_mode, len(y_true),
+                 max_samples if max_samples else "full", acc, slot_hist)
+    return {"top1": acc, "samples": len(y_true), "slot_hist": slot_hist,
+            "prefix_mode": prefix_mode, "actual_prefix_mode": actual_prefix_mode}
+
+
 # ============================================================================
 #  Baseline comparison
 # ============================================================================
@@ -408,12 +489,18 @@ def run_baseline_compare(backbone, data_loader, atlas_layers, total_classes: int
             backbone, data_loader, atlas_layers, total_classes, task_id,
             config=config, prefix_mode="current", tag="current")
     sq_current_total = sq_current["top1"] if sq_current else None
+    proto_result = None
+    if config.get("audit_prototype_router", True):
+        proto_result = evaluate_prototype_path_router(
+            backbone, data_loader, atlas_layers, total_classes, task_id, config=config)
+    proto_total = proto_result["top1"] if proto_result else None
 
     logging.info("[SlotQualityBaselineCompare] task=%d raw=%.2f path=%.2f cand_path=%.2f "
-                 "sq_deploy=%.2f sq_current=%s oracle=%.2f "
+                 "sq_deploy=%.2f sq_current=%s proto=%s oracle=%.2f "
                  "deploy_gain_vs_raw=%+.2f deploy_gain_vs_path=%+.2f deploy_gap_to_oracle=%.2f",
                  task_id, raw_nll, path_nll, candidate_path, sq_total,
                  f"{sq_current_total:.2f}" if sq_current_total is not None else "disabled",
+                 f"{proto_total:.2f}" if proto_total is not None else "disabled",
                  oracle, sq_total - raw_nll, sq_total - path_nll, oracle - sq_total)
 
     # Oracle match
@@ -423,11 +510,24 @@ def run_baseline_compare(backbone, data_loader, atlas_layers, total_classes: int
     first_atlas = min(atlas_layers)
 
     sq_match = raw_match = path_match = 0
+    proto_top1_match = 0
+    proto_topm_match = 0
     total = 0
     sq_hist = {}
     raw_hist = {}
     path_hist = {}
+    proto_hist = {}
     max_samples = 256  # oracle slot eval is expensive; 256 samples is enough for match stats
+    proto_top_m = config.get("prototype_top_m", 3)
+    proto_router = None
+    if config.get("audit_prototype_router", True):
+        from gase.routing.prototype_router import PrototypeNLLSlotRouter
+        proto_router = PrototypeNLLSlotRouter(
+            temperature=config.get("prototype_temperature", 1.0),
+            use_logdet=config.get("prototype_use_logdet", True),
+            use_proto_prior=config.get("prototype_use_prior", True),
+            aggregate=config.get("prototype_aggregate", "logsumexp"),
+        )
 
     with torch.no_grad():
         for _, inputs, targets in data_loader:
@@ -478,6 +578,15 @@ def run_baseline_compare(backbone, data_loader, atlas_layers, total_classes: int
             raw_match += int((raw_slot == best_slot).sum())
             path_match += int((path_slot == best_slot).sum())
 
+            if proto_router is not None:
+                proto_routing = proto_router.route(h9, cs, ss_dict)
+                proto_slot = proto_routing["slot_ids"]
+                proto_top_ids, _, _ = proto_router.topm_slot_ids(h9, cs, ss_dict, m=proto_top_m)
+                proto_top1_match += int((proto_slot == best_slot).sum())
+                proto_topm_match += int((proto_top_ids == best_slot.unsqueeze(1)).any(dim=1).sum())
+                for s in proto_slot.unique().tolist():
+                    proto_hist[int(s)] = proto_hist.get(int(s), 0) + int((proto_slot == s).sum())
+
             for s in sq_slot.unique().tolist():
                 sq_hist[int(s)] = sq_hist.get(int(s), 0) + int((sq_slot == s).sum())
             for s in raw_slot.unique().tolist():
@@ -488,18 +597,26 @@ def run_baseline_compare(backbone, data_loader, atlas_layers, total_classes: int
     logging.info("[SlotQualityBaselineOracleMatch] task=%d sq=%.1f%% raw=%.1f%% path=%.1f%%",
                  task_id, 100 * sq_match / max(total, 1),
                  100 * raw_match / max(total, 1), 100 * path_match / max(total, 1))
-    logging.info("[SlotQualityBaselineHist] task=%d sq=%s raw=%s path=%s",
-                 task_id, sq_hist, raw_hist, path_hist)
+    if proto_router is not None:
+        logging.info("[PrototypeRouterOracleCoverage] task=%d top1=%.1f%% top%d=%.1f%%",
+                     task_id, 100 * proto_top1_match / max(total, 1), proto_top_m,
+                     100 * proto_topm_match / max(total, 1))
+    logging.info("[SlotQualityBaselineHist] task=%d sq=%s raw=%s path=%s proto=%s",
+                 task_id, sq_hist, raw_hist, path_hist, proto_hist)
 
     return {"sq_top1": sq_total,
             "sq_deploy_top1": sq_total,
             "sq_current_top1": sq_current_total,
             "sq_deploy": sq_deploy,
             "sq_current": sq_current,
+            "prototype_path": proto_result,
             "sq_hist": sq_hist, "raw_hist": raw_hist, "path_hist": path_hist,
+            "proto_hist": proto_hist,
             "sq_oracle_match": 100 * sq_match / max(total, 1),
             "raw_oracle_match": 100 * raw_match / max(total, 1),
-            "path_oracle_match": 100 * path_match / max(total, 1)}
+            "path_oracle_match": 100 * path_match / max(total, 1),
+            "proto_top1_oracle_match": 100 * proto_top1_match / max(total, 1),
+            "proto_topm_oracle_match": 100 * proto_topm_match / max(total, 1)}
 
 
 # ============================================================================

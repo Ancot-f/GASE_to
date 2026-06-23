@@ -51,6 +51,9 @@ class SlotState:
     key_var: Optional[Tensor] = None
     router_key: Optional[Tensor] = None      # [r_q] shared Q-space key
     router_var: Optional[Tensor] = None      # [r_q] shared Q-space variance
+    router_proto_key: Optional[Tensor] = None  # [K, r_q] multi-prototype keys
+    router_proto_var: Optional[Tensor] = None  # [K, r_q] diagonal variances
+    router_proto_count: Optional[Tensor] = None  # [K] prototype supports
     router_support: int = 0
     router_nll_mean: Optional[float] = None
     router_nll_std: Optional[float] = None
@@ -98,6 +101,7 @@ class SlotState:
             "B_shape": list(self.B.shape) if self.B is not None else None,
             "b_shape": list(self.b.shape) if self.b is not None else None,
             "key_shape": list(self.key.shape) if self.key is not None else None,
+            "router_proto_key_shape": list(self.router_proto_key.shape) if self.router_proto_key is not None else None,
             "support": self.support,
             "quality": self.quality,
             "state": self.state,

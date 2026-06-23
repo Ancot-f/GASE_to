@@ -32,6 +32,8 @@ class SlotBuilder:
         self.min_support: int = config.get("min_support", 16)
         self.reuse_threshold: float = config.get("reuse_threshold", 0.25)
         self.new_slot_threshold: float = config.get("new_slot_threshold", 0.45)
+        self.router_num_prototypes: int = config.get("router_num_prototypes", 1)
+        self.router_kmeans_iters: int = config.get("router_kmeans_iters", 8)
 
     # ------------------------------------------------------------------
     #  Phase-4: single slot creation
@@ -81,6 +83,8 @@ class SlotBuilder:
 
         # Phase-7.5: router_key in shared Q-space
         router_key, router_var = self.compute_router_key(h_chart, chart_state)
+        router_proto_key, router_proto_var, router_proto_count = self.compute_router_prototypes(
+            h_chart, chart_state, num_prototypes=self.router_num_prototypes)
 
         slot_state = SlotState(
             slot_id=slot_id,
@@ -96,6 +100,9 @@ class SlotBuilder:
             key_var=key_var.clone().detach(),
             router_key=router_key.clone().detach(),
             router_var=router_var.clone().detach(),
+            router_proto_key=router_proto_key.clone().detach() if router_proto_key is not None else None,
+            router_proto_var=router_proto_var.clone().detach() if router_proto_var is not None else None,
+            router_proto_count=router_proto_count.clone().detach() if router_proto_count is not None else None,
             router_support=h_chart.shape[0],
             support=h_chart.shape[0],
             quality={},
@@ -126,10 +133,11 @@ class SlotBuilder:
             "P_shape=%s R_shape=%s "
             "adapter_basis=P_cross_cov router_basis=shared_Q "
             "adapter_key_norm=%.4f router_key_norm=%.4f router_var_mean=%.4f "
-            "b_norm=%.4f support=%d",
+            "router_prototypes=%d b_norm=%.4f support=%d",
             chart_state.layer_id, chart_state.chart_id, slot_id,
             list(P.shape), list(R.shape),
             float(key.norm()), float(router_key.norm()), float(router_var.mean()),
+            int(router_proto_key.shape[0]) if router_proto_key is not None else 0,
             float(b.norm()), h_chart.shape[0],
         )
         return slot_state
@@ -214,6 +222,68 @@ class SlotBuilder:
         key = z.mean(dim=0)
         var = z.var(dim=0, unbiased=False) + 1e-6
         return key, var
+
+    def compute_router_prototypes(
+        self, h_chart: Tensor, chart_state: ChartState, num_prototypes: int,
+    ) -> Tuple[Tensor, Tensor, Tensor]:
+        """
+        Build deploy-visible multi-prototype router statistics in chart Q-space.
+
+        These prototypes are purely feature-density statistics: they use h_chart and
+        chart geometry only. Labels, logits, and oracle correctness are not used.
+        """
+        Q = chart_state.Q_router
+        if Q is None:
+            Q = chart_state.U
+            chart_state.Q_router = Q
+            chart_state.router_rank = Q.shape[1] if Q is not None else 0
+        if Q is None or h_chart.numel() == 0:
+            zdim = 1
+            return (torch.zeros(1, zdim, device=h_chart.device),
+                    torch.ones(1, zdim, device=h_chart.device),
+                    torch.ones(1, device=h_chart.device))
+
+        X = h_chart - chart_state.mu.to(h_chart.device).unsqueeze(0)
+        z = X @ Q.to(h_chart.device)
+        N, zdim = z.shape
+        K = max(1, min(int(num_prototypes), N))
+        if K == 1:
+            return (z.mean(dim=0, keepdim=True),
+                    z.var(dim=0, unbiased=False, keepdim=True) + 1e-6,
+                    torch.tensor([N], device=h_chart.device, dtype=z.dtype))
+
+        # Deterministic initialization: spread centers by feature norm quantiles.
+        order = torch.argsort(z.norm(dim=1))
+        init_pos = torch.linspace(0, N - 1, steps=K, device=h_chart.device).round().long()
+        centers = z[order[init_pos]].clone()
+
+        assign = torch.zeros(N, dtype=torch.long, device=h_chart.device)
+        for _ in range(max(1, self.router_kmeans_iters)):
+            dist = torch.cdist(z, centers).pow(2)
+            assign = dist.argmin(dim=1)
+            new_centers = centers.clone()
+            for k in range(K):
+                mask = assign == k
+                if mask.any():
+                    new_centers[k] = z[mask].mean(dim=0)
+            if torch.allclose(new_centers, centers, atol=1e-5, rtol=1e-4):
+                centers = new_centers
+                break
+            centers = new_centers
+
+        proto_var = torch.zeros(K, zdim, device=h_chart.device, dtype=z.dtype)
+        proto_count = torch.zeros(K, device=h_chart.device, dtype=z.dtype)
+        global_var = z.var(dim=0, unbiased=False) + 1e-6
+        for k in range(K):
+            mask = assign == k
+            count = int(mask.sum().item())
+            proto_count[k] = max(count, 1)
+            if count >= 2:
+                proto_var[k] = z[mask].var(dim=0, unbiased=False) + 1e-6
+            else:
+                proto_var[k] = global_var
+
+        return centers, proto_var, proto_count
 
     def evaluate_slot_compatibility(
         self,
