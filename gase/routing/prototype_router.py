@@ -1,4 +1,4 @@
-"""PrototypeNLLSlotRouter: multi-prototype deploy-prefix slot routing."""
+"""ChartSlotPrototypeRouter: chart-conditioned multi-prototype slot routing."""
 
 from typing import Any, Dict, List, Tuple
 
@@ -7,13 +7,13 @@ import torch.nn.functional as F
 from torch import Tensor
 
 
-class PrototypeNLLSlotRouter:
+class ChartSlotPrototypeRouter:
     """
-    Route slots with a mixture of diagonal Gaussian prototypes in chart Q-space.
+    Route slots within one chart using diagonal Gaussian prototypes in chart Q-space.
 
     Each slot may store K prototype means/variances learned from deploy-visible
-    h_chart features. The slot score is log p(h | slot), approximated by a
-    prototype mixture. Higher score is better.
+    h_chart features for that chart. The score is log p(slot | h, chart) up to
+    normalization, approximated by a prototype mixture. Higher score is better.
     """
 
     def __init__(
@@ -118,3 +118,7 @@ class PrototypeNLLSlotRouter:
         top_idx = scores.topk(k=k, dim=1).indices
         id_tensor = torch.tensor(slot_id_list, dtype=torch.long, device=h_chart.device)
         return id_tensor[top_idx], slot_id_list, scores
+
+
+# Backward-compatible alias for earlier experimental imports.
+PrototypeNLLSlotRouter = ChartSlotPrototypeRouter

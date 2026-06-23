@@ -754,9 +754,9 @@ class GASELearner(BaseLearner):
                             eval_parts += [f"SlotQualityDeploy={sq_deploy:.2f}"]
                         if sq_current is not None:
                             eval_parts += [f"SlotQualityCurrentDiag={sq_current:.2f}"]
-                        proto_path = bc.get("prototype_path")
+                        proto_path = bc.get("chart_slot_prototype_path", bc.get("prototype_path"))
                         if proto_path and proto_path.get("top1") is not None:
-                            eval_parts += [f"PrototypePath={proto_path.get('top1', 0):.2f}"]
+                            eval_parts += [f"ChartSlotPrototypePath={proto_path.get('top1', 0):.2f}"]
                     best_so_far = max(v for v in [path_nll_result.get("top1", 0) if path_nll_result else 0,
                                                     raw_nll_total] if v > 0)
                     eval_parts += [f"Oracle-gap-raw={oracle_result.get('top1', 0) - raw_nll_total:.2f}"]
@@ -893,7 +893,9 @@ class GASELearner(BaseLearner):
         )
 
         # Fit adapter
-        distiller = ChartAdapterDistiller(self.args.get("distill", {}))
+        distill_cfg = dict(self.args.get("distill", {}))
+        distill_cfg.update(self.args.get("chart_adapter", {}))
+        distiller = ChartAdapterDistiller(distill_cfg)
         adapter, metrics = distiller.fit_linear_chart_adapter(
             chart_state, slot_state, h_chart, delta_teacher,
         )
@@ -2633,7 +2635,7 @@ class GASELearner(BaseLearner):
         if self.phase910_audit_results:
             baseline_compare = self.phase910_audit_results.get("baseline_compare", {})
             sq_deploy_total = baseline_compare.get("sq_deploy_top1")
-            proto_path = baseline_compare.get("prototype_path")
+            proto_path = baseline_compare.get("chart_slot_prototype_path", baseline_compare.get("prototype_path"))
             if isinstance(proto_path, dict):
                 proto_path_total = proto_path.get("top1")
 
@@ -2670,7 +2672,7 @@ class GASELearner(BaseLearner):
         if sq_deploy_total is not None:
             parts += [f"slot_quality_deploy={sq_deploy_total:.2f}"]
         if proto_path_total is not None:
-            parts += [f"prototype_path={proto_path_total:.2f}"]
+            parts += [f"chart_slot_prototype_path={proto_path_total:.2f}"]
         if self.path_score_eval and bz_total is not None:
             parts += [f"balanced_z={bz_total:.2f}", f"percentile_path={perc_total:.2f}",
                       f"percentile_s0p={ps0p_total:.2f}"]
@@ -2692,7 +2694,7 @@ class GASELearner(BaseLearner):
         if sq_deploy_total is not None:
             scores["slot_quality_deploy"] = sq_deploy_total
         if proto_path_total is not None:
-            scores["prototype_path"] = proto_path_total
+            scores["chart_slot_prototype_path"] = proto_path_total
         if self.path_gate_eval:
             scores.update({
                 "candidate_margin_hybrid": cm_total,
@@ -2710,7 +2712,7 @@ class GASELearner(BaseLearner):
         # Separate credible routers from diagnostic-only
         credible_keys = {"shared_q_dist", "raw_nll", "calib_nll", "calib_prior", "slot0_penalty",
                          "path_raw_nll", "candidate_path_raw_nll", "hybrid_path_raw_nll",
-                         "slot_quality_deploy", "prototype_path",
+                         "slot_quality_deploy", "chart_slot_prototype_path",
                          "candidate_margin_hybrid", "layer_agreement_hybrid",
                          "candidate_agreement_hybrid", "balanced_z", "percentile_path", "percentile_s0p"}
         credible_scores = {k: v for k, v in scores.items() if k in credible_keys and v is not None}

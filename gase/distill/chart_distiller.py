@@ -89,6 +89,8 @@ class ChartAdapterDistiller:
             chart_id=chart_state.chart_id,
             slot_id=slot_state.slot_id,
             layer_id=chart_state.layer_id,
+            tangent_projection=self.config.get("tangent_projection", False),
+            max_delta_ratio=self.config.get("max_delta_ratio", 0.0),
         )
         adapter.to(h_chart.device)
         adapter.set_projection_bases(P, R)
@@ -103,8 +105,10 @@ class ChartAdapterDistiller:
             "[AdapterContract] layer=%d chart=%d slot=%d "
             "definition=local_residual_operator method=ridge_regression "
             "formula=b+RBP^T(h-mu) "
+            "tangent_projection=%s max_delta_ratio=%.3f "
             "residual_cos=%.4f fit_r2=%.4f norm_ratio=%.4f",
             chart_state.layer_id, chart_state.chart_id, slot_state.slot_id,
+            adapter.tangent_projection, adapter.max_delta_ratio,
             metrics["residual_cos"], metrics["fit_r2"], metrics["norm_ratio"],
         )
 

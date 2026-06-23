@@ -47,7 +47,11 @@
         "router_num_prototypes": 4,
         "router_kmeans_iters": 8
     },
-    "chart_adapter": {"type": "linear"},
+    "chart_adapter": {
+        "type": "linear",
+        "tangent_projection": true,
+        "max_delta_ratio": 1.5
+    },
     "free_adapter": {"enabled": true, "bottleneck_dim": 16, "dropout": 0.0, "scale": 1.0, "epochs": 3, "lr": 0.001},
     "distill": {"ridge_lambda": 0.001},
 

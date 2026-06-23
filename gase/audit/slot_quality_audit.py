@@ -386,11 +386,11 @@ def evaluate_slot_quality_baseline_router(backbone, data_loader, atlas_layers,
             "prefix_mode": prefix_mode, "actual_prefix_mode": actual_prefix_mode}
 
 
-def evaluate_prototype_path_router(backbone, data_loader, atlas_layers,
-                                    total_classes: int, task_id: int,
-                                    config: Optional[dict] = None) -> Dict:
-    """Evaluate deploy-prefix L9 multi-prototype routing with path-forced slots."""
-    from gase.routing.prototype_router import PrototypeNLLSlotRouter
+def evaluate_chart_slot_prototype_path_router(backbone, data_loader, atlas_layers,
+                                               total_classes: int, task_id: int,
+                                               config: Optional[dict] = None) -> Dict:
+    """Evaluate deploy-prefix chart-conditioned prototype routing with path-forced slots."""
+    from gase.routing.prototype_router import ChartSlotPrototypeRouter
 
     backbone.eval()
     config = config or {}
@@ -398,7 +398,7 @@ def evaluate_prototype_path_router(backbone, data_loader, atlas_layers,
     first_atlas = min(atlas_layers)
     prefix_mode = config.get("slot_quality_prefix_mode", "path_key_slot_student")
     max_samples = config.get("slot_quality_audit_max_samples", 0)
-    router = PrototypeNLLSlotRouter(
+    router = ChartSlotPrototypeRouter(
         temperature=config.get("prototype_temperature", 1.0),
         use_logdet=config.get("prototype_use_logdet", True),
         use_proto_prior=config.get("prototype_use_prior", True),
@@ -452,14 +452,14 @@ def evaluate_prototype_path_router(backbone, data_loader, atlas_layers,
             all_labels.append(targets.cpu().numpy())
 
     if not all_preds:
-        logging.info("[PrototypePathRouter][WARN] task=%d no samples evaluated", task_id)
+        logging.info("[ChartSlotPrototypePathRouter][WARN] task=%d no samples evaluated", task_id)
         return {"top1": 0.0, "samples": 0, "slot_hist": slot_hist,
                 "prefix_mode": prefix_mode, "actual_prefix_mode": actual_prefix_mode}
 
     y_pred = np.concatenate(all_preds)
     y_true = np.concatenate(all_labels)
     acc = 100.0 * (y_pred == y_true).sum() / max(len(y_true), 1)
-    logging.info("[PrototypePathRouter] task=%d prefix_mode=%s actual_prefix_mode=%s "
+    logging.info("[ChartSlotPrototypePathRouter] task=%d chart_id=0 prefix_mode=%s actual_prefix_mode=%s "
                  "samples=%d max_samples=%s total=%.2f slot_hist=%s",
                  task_id, prefix_mode, actual_prefix_mode, len(y_true),
                  max_samples if max_samples else "full", acc, slot_hist)
@@ -491,7 +491,7 @@ def run_baseline_compare(backbone, data_loader, atlas_layers, total_classes: int
     sq_current_total = sq_current["top1"] if sq_current else None
     proto_result = None
     if config.get("audit_prototype_router", True):
-        proto_result = evaluate_prototype_path_router(
+        proto_result = evaluate_chart_slot_prototype_path_router(
             backbone, data_loader, atlas_layers, total_classes, task_id, config=config)
     proto_total = proto_result["top1"] if proto_result else None
 
@@ -521,8 +521,8 @@ def run_baseline_compare(backbone, data_loader, atlas_layers, total_classes: int
     proto_top_m = config.get("prototype_top_m", 3)
     proto_router = None
     if config.get("audit_prototype_router", True):
-        from gase.routing.prototype_router import PrototypeNLLSlotRouter
-        proto_router = PrototypeNLLSlotRouter(
+        from gase.routing.prototype_router import ChartSlotPrototypeRouter
+        proto_router = ChartSlotPrototypeRouter(
             temperature=config.get("prototype_temperature", 1.0),
             use_logdet=config.get("prototype_use_logdet", True),
             use_proto_prior=config.get("prototype_use_prior", True),
@@ -598,7 +598,7 @@ def run_baseline_compare(backbone, data_loader, atlas_layers, total_classes: int
                  task_id, 100 * sq_match / max(total, 1),
                  100 * raw_match / max(total, 1), 100 * path_match / max(total, 1))
     if proto_router is not None:
-        logging.info("[PrototypeRouterOracleCoverage] task=%d top1=%.1f%% top%d=%.1f%%",
+        logging.info("[ChartSlotPrototypeOracleCoverage] task=%d chart_id=0 top1=%.1f%% top%d=%.1f%%",
                      task_id, 100 * proto_top1_match / max(total, 1), proto_top_m,
                      100 * proto_topm_match / max(total, 1))
     logging.info("[SlotQualityBaselineHist] task=%d sq=%s raw=%s path=%s proto=%s",
@@ -609,7 +609,7 @@ def run_baseline_compare(backbone, data_loader, atlas_layers, total_classes: int
             "sq_current_top1": sq_current_total,
             "sq_deploy": sq_deploy,
             "sq_current": sq_current,
-            "prototype_path": proto_result,
+            "chart_slot_prototype_path": proto_result,
             "sq_hist": sq_hist, "raw_hist": raw_hist, "path_hist": path_hist,
             "proto_hist": proto_hist,
             "sq_oracle_match": 100 * sq_match / max(total, 1),

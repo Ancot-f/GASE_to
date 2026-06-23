@@ -24,6 +24,8 @@ class LinearChartAdapter(nn.Module):
     Performs: delta = b + R @ B @ P^T @ (h - mu)
 
     where B is a learned linear map in the low-rank latent space.
+    Optionally applies v3-style tangent projection and norm clamp so the
+    high-dimensional residual remains a local chart-tangent update.
     """
 
     def __init__(
@@ -34,6 +36,8 @@ class LinearChartAdapter(nn.Module):
         chart_id: int = -1,
         slot_id: int = -1,
         layer_id: int = -1,
+        tangent_projection: bool = False,
+        max_delta_ratio: float = 0.0,
     ):
         """
         Args:
@@ -43,6 +47,8 @@ class LinearChartAdapter(nn.Module):
             chart_id: chart this adapter belongs to.
             slot_id: slot this adapter belongs to.
             layer_id: ViT block index.
+            tangent_projection: remove radial residual component along h.
+            max_delta_ratio: cap ||delta|| <= ratio * ||h|| when > 0.
         """
         super().__init__()
         self.dim = dim
@@ -51,6 +57,8 @@ class LinearChartAdapter(nn.Module):
         self.chart_id = chart_id
         self.slot_id = slot_id
         self.layer_id = layer_id
+        self.tangent_projection = bool(tangent_projection)
+        self.max_delta_ratio = float(max_delta_ratio)
 
         # Projection bases (set externally after distillation)
         self.register_buffer("P", torch.empty(dim, input_rank))
@@ -79,6 +87,21 @@ class LinearChartAdapter(nn.Module):
         z_out = z_in @ self.B.T
         # delta: [B, D]
         delta = z_out @ self.R + self.b.unsqueeze(0)
+        delta = self._postprocess_delta(delta, h_chart)
+        return delta
+
+    def _postprocess_delta(self, delta: Tensor, h_chart: Tensor) -> Tensor:
+        """Apply optional v3-style tangent projection and norm clamp."""
+        if self.tangent_projection:
+            h_norm = h_chart.norm(p=2, dim=-1, keepdim=True).clamp_min(1e-8)
+            h_hat = h_chart / h_norm
+            radial = (delta * h_hat).sum(dim=-1, keepdim=True)
+            delta = delta - radial * h_hat
+        if self.max_delta_ratio > 0:
+            ref_norm = h_chart.norm(p=2, dim=-1, keepdim=True).clamp_min(1e-8)
+            delta_norm = delta.norm(p=2, dim=-1, keepdim=True).clamp_min(1e-8)
+            scale = torch.clamp(self.max_delta_ratio * ref_norm / delta_norm, max=1.0)
+            delta = delta * scale
         return delta
 
     def set_projection_bases(self, P: Tensor, R: Tensor) -> None:
@@ -95,7 +118,8 @@ class LinearChartAdapter(nn.Module):
         return (
             f"chart_id={self.chart_id}, slot_id={self.slot_id}, "
             f"layer_id={self.layer_id}, input_rank={self.input_rank}, "
-            f"output_rank={self.output_rank}"
+            f"output_rank={self.output_rank}, tangent_projection={self.tangent_projection}, "
+            f"max_delta_ratio={self.max_delta_ratio}"
         )
 
 
